@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output
+output.md
+*.log
+
+# Data (생성된 더미 데이터는 커밋, 실제 운영 데이터는 제외하고 싶다면 아래 주석 해제)
+# data/records.jsonl
+
+# OS
+.DS_Store
+Thumbs.db
