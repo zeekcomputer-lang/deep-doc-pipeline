@@ -2,7 +2,11 @@
 
 저성능 모델 극복형 초정밀 심층 문서 분석 파이프라인. LangGraph + 순수 OpenAI SDK + Pydantic 강제.
 
-> 상세 설계는 [`SPEC.md`](./SPEC.md) 참조.
+## 문서
+
+- **[`SPEC.md`](./SPEC.md)** — 설계 명세서 (v1.1, 단일 진실 공급원)
+- **[`HANDOFF.md`](./HANDOFF.md)** — 다음 AI Agent 인수인계 문서
+- **[`LESSONS.md`](./LESSONS.md)** — 누적 교훈 인덱스 (L-001~L-009)
 
 ## 구조
 
