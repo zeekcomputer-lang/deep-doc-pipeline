@@ -247,18 +247,19 @@ _504_MAX_STEPS: int = 10           # max 50KB total reduction
 _504_MIN_BUDGET: int = 10 * 1024   # never go below 10KB
 _504_MIN_TOKENS: int = 1_024       # never go below 1,024 tokens
 
-# Persistent offsets — reduced on 504, persist across calls within a pipeline run.
-# This implements "previous step regression": once budget is reduced,
-# ALL subsequent LLM calls in the pipeline use the reduced limits.
+# Persistent offsets — reduced on 504, scoped per node via @retry_on_504.
 _504_token_offset: int = 0
 _504_budget_offset: int = 0
+_504_count: int = 0           # cumulative 504s in current node scope
+_504_REASONING_THRESHOLD = 5  # downgrade reasoning_effort after this many 504s
 
 
 def reset_504_state() -> None:
-    """Reset 504 reduction offsets. Call once at pipeline start."""
-    global _504_token_offset, _504_budget_offset
+    """Reset 504 state. Called by @retry_on_504 at node entry/exit."""
+    global _504_token_offset, _504_budget_offset, _504_count
     _504_token_offset = 0
     _504_budget_offset = 0
+    _504_count = 0
 
 
 def _is_504(e: Exception) -> bool:
@@ -271,10 +272,11 @@ def _is_504(e: Exception) -> bool:
 
 
 def _reduce_504() -> None:
-    """Globally reduce budget + tokens by 5KB. Persists for all subsequent calls."""
-    global _504_token_offset, _504_budget_offset
+    """Reduce budget + tokens by 5KB within current node scope."""
+    global _504_token_offset, _504_budget_offset, _504_count
     _504_token_offset += _504_REDUCE_TOKENS
     _504_budget_offset += _504_REDUCE_BYTES
+    _504_count += 1
 
 
 def effective_budget() -> int:
@@ -285,6 +287,17 @@ def effective_budget() -> int:
 def effective_max_tokens(base: int = MAX_COMPLETION_TOKENS) -> int:
     """Current effective output token limit (base minus 504 reductions)."""
     return max(base - _504_token_offset, _504_MIN_TOKENS)
+
+
+def effective_reasoning(base: str = "high") -> str:
+    """Downgrade reasoning_effort after 5+ consecutive 504s.
+
+    high → medium reduces server-side processing time per request,
+    which is the primary cause of 504 Gateway Timeout.
+    """
+    if _504_count >= _504_REASONING_THRESHOLD:
+        return "medium"
+    return base
 
 
 class Timeout504Error(Exception):
@@ -344,6 +357,7 @@ def structured_call(
         # Current effective limits (may have been reduced by prior 504s)
         eff_budget = effective_budget()
         eff_tokens = effective_max_tokens(max_tokens)
+        eff_reasoning = effective_reasoning(reasoning_effort)
 
         try:
             # ── Budget hard limit ──
@@ -369,7 +383,7 @@ def structured_call(
                         model=model,
                         messages=work_messages,
                         temperature=temperature,
-                        reasoning_effort=reasoning_effort,
+                        reasoning_effort=eff_reasoning,
                         max_tokens=eff_tokens,
                         stream=True,
                     )
@@ -384,7 +398,7 @@ def structured_call(
                         model=model,
                         messages=work_messages,
                         temperature=temperature,
-                        reasoning_effort=reasoning_effort,
+                        reasoning_effort=eff_reasoning,
                         max_tokens=eff_tokens,
                     )
                     last_raw = response.choices[0].message.content or ""
@@ -399,9 +413,10 @@ def structured_call(
                 _reduce_504()
                 new_budget = effective_budget()
                 new_tokens = effective_max_tokens(max_tokens)
+                eff_r = effective_reasoning(reasoning_effort)
                 psub("structured_call",
-                     f"504 → 5KB 감축: budget {new_budget//1024}KB, "
-                     f"tokens {new_tokens} (offset {_504_budget_offset//1024}KB)")
+                     f"504 #{_504_count}: budget {new_budget//1024}KB, "
+                     f"tokens {new_tokens}, reasoning={eff_r}")
                 raise Timeout504Error(
                     f"504 after reduction: budget={new_budget//1024}KB, "
                     f"tokens={new_tokens}"
