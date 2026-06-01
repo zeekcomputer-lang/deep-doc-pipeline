@@ -1,4 +1,4 @@
-# Deep Doc Pipeline (v1.3.1)
+# Deep Doc Pipeline (v1.4)
 
 JSONL 문서 → 영문 분석·집필 → 한국어 백서 자동 생성 파이프라인.
 LangGraph + OpenAI SDK + Pydantic 강제 출력.
@@ -80,6 +80,14 @@ python -m main --output out.md   # 출력 경로 지정
 | `LLM_MAX_CONCURRENT` | 5 | 동시 호출 상한 |
 | `LLM_CONTEXT_BUDGET_KB` | 95 | per-call 컨텍스트 예산 (KB) |
 
+## 출력 구조
+
+```bash
+python -m main --output report.md
+# → report.md      한글 백서 (성공) 또는 상위 3건 후보 (실패)
+# → report_en.md   영문 원본 (항상 생성)
+```
+
 ## 핵심 방어 기제
 
 | 위험 | 방어 |
@@ -88,3 +96,4 @@ python -m main --output out.md   # 출력 경로 지정
 | Fail-Safe 강제통과 | ⚠️ 워터마크 삽입 + `unverified_sections` 감사 로그 |
 | 윤문 환각 재주입 | compiler(Python) → polish(LLM) → final_fact_checker 분리 |
 | 번역 고유명사 소실 | `extract_proper_nouns` + 구조 검증 + LLM 스팟체크 3중 방어 |
+| 504 타임아웃 | 국부 감축(-5KB/step) + 노드 재실행 + 성공 후 원복. user 메시지 절단 금지 |

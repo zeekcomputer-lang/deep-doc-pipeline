@@ -13,7 +13,13 @@
 > **v1.3 변경 요약 (2026-06-01, SPEC 외부 작업 — HANDOFF.md 상세):**
 > - 모든 LLM 프롬프트 영어 강제 (EN-only) + `status_report` 모드 제거 (백서 전용)
 > - Phase 5 신설: EN→KR 수석 에디터 스타일 렌더링 + 3중 검증 (Python+구조+LLM)
-> - 본 SPEC은 v1.1 설계 원본을 보존. v1.3 상세는 HANDOFF.md §1·§3·§4 참조
+> - 본 SPEC은 v1.1 설계 원본을 보존. v1.3/v1.4 상세는 HANDOFF.md §1·§3·§4 참조
+>
+> **v1.4 변경 요약 (2026-06-01):**
+> - 504 국부 감축: `@retry_on_504` 데코레이터 + `effective_budget()` + `Timeout504Error`
+> - user 메시지 절단 금지, 노드 재실행으로 분할 로직 재생성
+> - `max_tokens=24,000` + `reasoning_effort="high"` 전역 적용
+> - 영문 원본 항상 분리 저장 (`_en.md`), 번역 검증 50%/30회/best-of-N
 
 ---
 
