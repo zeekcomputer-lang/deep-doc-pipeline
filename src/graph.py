@@ -27,17 +27,11 @@ def build_graph():
     g.add_conditional_edges("chrono_sorter", N.fanout_to_period_summarizer, ["period_summarizer"])
     g.add_edge("period_summarizer", "theme_analyzer")
 
-    # ── Phase 3: 라우터
-    g.add_node("status_formatter", N.status_formatter_node)
+    # ── Whitepaper-only (v1.3: status_report removed)
     g.add_node("draft_planner", N.draft_planner_node)
     g.add_node("planner_critique", N.planner_critique_node)
 
-    g.add_conditional_edges(
-        "theme_analyzer",
-        N.route_by_target,
-        {"status_report": "status_formatter", "whitepaper": "draft_planner"},
-    )
-    g.add_edge("status_formatter", END)
+    g.add_edge("theme_analyzer", "draft_planner")
 
     # ── Phase 4-B [1단계]: 기획 루프
     g.add_edge("draft_planner", "planner_critique")
@@ -93,12 +87,33 @@ def build_graph():
         "final_fact_checker",
         N.route_final_check,
         {
-            "END": END,
+            "prepare_translation": "prepare_translation",
             "retry_polish": "retry_polish",
             "fallback_to_compiled": "fallback_to_compiled",
         },
     )
     g.add_edge("retry_polish", "polish")
-    g.add_edge("fallback_to_compiled", END)
+    g.add_edge("fallback_to_compiled", "prepare_translation")
+
+    # ── Phase 5: Translation (English → Korean)
+    g.add_node("prepare_translation", N.prepare_translation_node)
+    g.add_node("translate", N.translate_node)
+    g.add_node("translation_checker", N.translation_checker_node)
+    g.add_node("retry_translate", N.retry_translate_node)
+    g.add_node("fallback_english", N.fallback_english_node)
+
+    g.add_edge("prepare_translation", "translate")
+    g.add_edge("translate", "translation_checker")
+    g.add_conditional_edges(
+        "translation_checker",
+        N.route_translation,
+        {
+            "END": END,
+            "retry_translate": "retry_translate",
+            "fallback_english": "fallback_english",
+        },
+    )
+    g.add_edge("retry_translate", "translate")
+    g.add_edge("fallback_english", END)
 
     return g.compile()

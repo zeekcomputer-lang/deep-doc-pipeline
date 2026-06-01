@@ -19,6 +19,7 @@
 | L-010 | 호환성 | response_format 의존 제거 → 프롬프트 가드 + extract_json 3단 파서가 GPT-OSS 표준 |
 | L-011 | 아키텍처 | 대용량 LLM 컨텍스트 504: Streaming + Section Chunking 이중 방어 |
 | L-012 | 아키텍처 | 95KB 하드리밋: 측정→분할→병합→교차검증 파이프라인, 손실 최소화 우선순위 4단계 |
+| L-013 | 아키텍처 | EN-only LLM + 후번역: 고유명사 추출→번역→3중검증(Python+구조+LLM) 파이프라인 |
 
 ---
 
@@ -294,6 +295,32 @@ gh repo edit zeekcomputer-lang/<repo> --visibility private
 4. 분류는 가급적 기존 카테고리 재사용:
    - 명세 / 워크플로 / 커뮤니케이션 / 호환성 / 아키텍처 / LangGraph / 환경 / 의사결정
 5. 각 카드 구조: 상황 → 원칙/대응 → 적용 위치 (또는 명령어)
+
+---
+
+---
+
+## L-013: EN-only LLM 출력 + 후번역 패턴
+
+**상황:**
+저성능 LLM(gpt-oss)이 한국어로 직접 작성하면 원래도 높은 환각률이 더 상승하고,
+영어 학습 데이터가 압도적으로 많은 모델 특성상 출력 품질이 저하됨.
+
+**접근법:**
+1. 모든 LLM 프롬프트·JSON guard·재시도 프롬프트를 영어로 강제
+2. 최종 백서가 영어로 완성된 후 번역 단계를 분리하여 EN→KR 변환
+3. 번역 단계에 3중 방어 적용:
+   - **Pure Python:** 고유명사 존재 여부 자동 검증 (30% 초과 소실 시 자동 반려)
+   - **구조 무결성:** 섹션 수 보존 확인
+   - **LLM 스팟체크:** 첫 섹션 쌍 샘플링으로 의미 충실도 검증
+4. Fail-safe: 2회 실패 시 영어 원본 보존 (데이터 손실 방지)
+
+**고유명사 추출 전략 (`extract_proper_nouns`):**
+- 날짜(YYYY-MM-DD/YYYY-MM), 약어(2+대문자), CamelCase, 문중 대문자, 단위 숫자, 백틱 토큰
+- 일반 영어 단어 필터링 (~150단어) 으로 오탐 최소화
+- 과다 추출 허용 (over-preserve > under-preserve)
+
+**적용:** `src/nodes.py` Phase 5, `src/utils.py` `extract_proper_nouns`
 
 ---
 

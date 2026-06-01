@@ -1,16 +1,21 @@
 # HANDOFF.md — 다음 AI Agent 인수인계 문서
 
-> **프로젝트:** deep-doc-pipeline (v1.1)
+> **프로젝트:** deep-doc-pipeline (v1.3)
 > **GitHub:** https://github.com/zeekcomputer-lang/deep-doc-pipeline (PUBLIC)
 > **로컬:** `~/.openclaw/workspace/projects/deep-doc-pipeline/`
-> **최종 업데이트:** 2026-05-29
-> **상태:** 코드 작성 완료 + 95KB 컨텍스트 예산 가드 전면 적용 / 실행 검증 보류 (사용자 환경 예정)
+> **최종 업데이트:** 2026-06-01
+> **상태:** v1.3 리팩터 완료 (EN-only LLM + 백서 전용 + EN→KR 번역 단계) / 실행 검증 보류
 
 ---
 
 ## §0. 30초 요약
 
-저성능 LLM(gpt-oss 등) 환경에서 **환각을 구조적으로 차단**하며 200건 JSONL → 백서/현황판을 자동 생성하는 **LangGraph 파이프라인**. 순수 OpenAI SDK + Pydantic 강제 출력 + 다단 자가검증 루프 + Fail-Safe 워터마크. 11 파일 / ~1700줄. **AST 문법 검증 통과 / 실제 LLM 실행은 미수행**.
+저성능 LLM(gpt-oss 등) 환경에서 **환각을 구조적으로 차단**하며 200건 JSONL → **한글 백서**를 자동 생성하는 **LangGraph 파이프라인**. 순수 OpenAI SDK + Pydantic 강제 출력 + 다단 자가검증 루프 + Fail-Safe 워터마크. 11 파일 / ~2300줄. **AST 문법 검증 통과 / 실제 LLM 실행은 미수행**.
+
+**v1.3 (2026-06-01) — 3대 변경:**
+1. **영어 전용 LLM 출력:** 모든 프롬프트·JSON guard·재시도 프롬프트가 영어로 강제. 고유명사 보존 명시적 지시.
+2. **백서 전용:** `status_report` 모드·`route_by_target`·`status_formatter_node` 완전 제거. `--format` CLI 인자 제거.
+3. **EN→KR 번역 단계 신설:** `prepare_translation` → `translate` → `translation_checker` → 라우터. 3중 방어(Python 고유명사 검증 + 구조 무결성 + LLM 스팟체크). Fail-safe: 2회 실패 시 영문 원본 보존.
 
 **v1.1-r1 (2026-05-29):** `src/llm.py`를 GPT-OSS placeholder 표준으로 리팩터 — `beta.parse` / `response_format` 전면 제거, `extract_json()` 3단 파서 도입, HARDCODE placeholder 패턴 적용. 표준 출처: `langgraph-excel-categorizer/categorizer.py`.
 
@@ -42,13 +47,13 @@ projects/deep-doc-pipeline/
 ├── scripts/
 │   └── gen_dummy.py       시드 고정(42) 결정론적 생성기
 └── src/
-    ├── schemas.py         7종 Pydantic (hallucinated_terms 강제 포함)
-    ├── state.py           GraphState + 3개 reducer (update_dict, operator.add ×2)
+    ├── schemas.py         8종 Pydantic (v1.3: TranslationCheckResult 추가)
+    ├── state.py           GraphState + 3개 reducer + 번역 상태 5필드
     ├── context_guard.py   ★ 95KB 예산 관리 (측정/분할/교차검증)
-    ├── llm.py             ★ GPT-OSS 표준 + Rate Limiter + 헤더 인증 + 예산 하드리밋
-    ├── utils.py           Pure Python (sort/filter/compile/validate/split)
-    ├── nodes.py           15개 노드 + 4개 라우터 (polish/fact_checker 청크드+스트리밍)
-    └── graph.py           LangGraph 조립 (Send 병렬 2곳)
+    ├── llm.py             ★ GPT-OSS 표준 + Rate Limiter + EN-only JSON guard
+    ├── utils.py           Pure Python (sort/filter/compile/validate/split/extract_proper_nouns)
+    ├── nodes.py           20개 노드 + 5개 라우터 (v1.3: 번역 5노드 추가, 현황판 제거)
+    └── graph.py           LangGraph 조립 (Send 병렬 2곳 + 번역 루프)
 ```
 
 ---

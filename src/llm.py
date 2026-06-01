@@ -279,12 +279,13 @@ def structured_call(
 
     # 프롬프트 가드: JSON Schema 힌트 + 출력 규약
     json_guard = (
-        "\n\n[출력 규약 — 엄수]\n"
-        "- 응답은 오직 하나의 JSON object 만 출력한다.\n"
-        "- 코드펜스(```), 설명, 머리말/꼬리말, 사고 과정 출력 금지.\n"
-        "- 응답의 첫 문자는 '{' 이어야 한다.\n"
-        "- 키/문자열은 모두 큰따옴표 사용. 후행 콤마 금지.\n"
-        f"\n[JSON Schema — 이 구조를 정확히 따르라]\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n"
+        "\n\n[OUTPUT PROTOCOL — MANDATORY]\n"
+        "- Respond with exactly one JSON object only.\n"
+        "- No code fences (```), explanations, preambles, postambles, or chain-of-thought.\n"
+        "- The first character of your response MUST be '{'.\n"
+        "- Use double quotes for all keys and strings. No trailing commas.\n"
+        "- All text content MUST be in English. Preserve proper nouns in their original form.\n"
+        f"\n[JSON Schema — follow this structure exactly]\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n"
     )
 
     # 작업용 메시지 목록 (원본 변경 방지)
@@ -361,10 +362,10 @@ def structured_call(
                 {
                     "role": "user",
                     "content": (
-                        "직전 응답은 유효한 JSON 이 아니거나 스키마에 맞지 않는다. "
-                        "동일 작업을 다시 수행하되, 오직 하나의 JSON object 만 출력하라. "
-                        "코드펜스/설명/머리말 모두 금지. "
-                        f"스키마: {json.dumps(schema, ensure_ascii=False)}"
+                        "The previous response was not valid JSON or did not match the schema. "
+                        "Perform the same task again, outputting exactly one JSON object only. "
+                        "No code fences, explanations, or preambles. "
+                        f"Schema: {json.dumps(schema, ensure_ascii=False)}"
                     ),
                 }
             )

@@ -1,11 +1,14 @@
 """
-결정론적 Pure Python 로직.
-LLM 호출 절대 금지. 날짜/필터/조립 등 논리 조작은 모두 여기서.
+Deterministic Pure Python logic.
+No LLM calls allowed. Date/filter/assembly/extraction operations go here.
+
+v1.3: English output for compile_sections and format_events_for_prompt.
+      Added extract_proper_nouns for translation preservation.
 """
 from __future__ import annotations
 import re
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 
 
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -13,7 +16,7 @@ PERIOD_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 
 
 def is_valid_date(s: str) -> bool:
-    """YYYY-MM-DD 형식 + 실제 유효 날짜인지 검증."""
+    """Validate YYYY-MM-DD format and actual calendar date."""
     if not isinstance(s, str) or not DATE_PATTERN.match(s):
         return False
     try:
@@ -24,34 +27,25 @@ def is_valid_date(s: str) -> bool:
 
 
 def chrono_sort_and_group(events: List[Dict[str, Any]]) -> Dict[str, List[Dict]]:
-    """
-    이벤트 리스트를 날짜순 정렬하고 YYYY-MM 키로 그룹핑.
-    유효하지 않은 날짜는 silently drop (extractor 단계에서 이미 검증되어 있어야 함).
-    """
+    """Sort events chronologically and group by YYYY-MM key."""
     valid = [e for e in events if is_valid_date(e.get("date", ""))]
     valid.sort(key=lambda e: e["date"])
     grouped: Dict[str, List[Dict]] = {}
     for ev in valid:
-        period = ev["date"][:7]  # "YYYY-MM"
+        period = ev["date"][:7]
         grouped.setdefault(period, []).append(ev)
     return grouped
 
 
 def filter_by_period(grouped: Dict[str, List[Dict]], target_period: str) -> List[Dict]:
-    """
-    context_filter_node 핵심 로직.
-    target_period에 해당하는 이벤트만 반환. LLM 환각 차단의 1차 방어선.
-    """
+    """Return events for target_period only. Primary defense against LLM hallucination."""
     if not PERIOD_PATTERN.match(target_period or ""):
         return []
     return grouped.get(target_period, [])
 
 
 def validate_outline_periods(outline: List[Dict], grouped: Dict[str, List[Dict]]) -> List[str]:
-    """
-    목차의 target_period가 실제 grouped 키에 존재하는지 검증.
-    존재하지 않는 기간 리스트 반환 (비어 있으면 정상).
-    """
+    """Verify outline target_periods exist in grouped keys. Returns invalid entries."""
     available = set(grouped.keys())
     invalid = []
     for item in outline:
@@ -63,60 +57,55 @@ def validate_outline_periods(outline: List[Dict], grouped: Dict[str, List[Dict]]
 
 def compile_sections(outline: List[Dict], completed: Dict[int, str],
                      unverified: List[int]) -> str:
-    """
-    Pure Python 조립. LLM 호출 금지.
-    목차 순서대로 헤더 + 본문을 단순 결합.
-    """
-    parts: List[str] = ["# 종합 백서\n"]
-    # outline은 사전(dict) 리스트이며 index 키를 가짐
+    """Pure Python assembly. No LLM calls. English output for subsequent translation."""
+    parts: List[str] = ["# Comprehensive Whitepaper\n"]
     sorted_items = sorted(outline, key=lambda x: x.get("index", 0))
     for item in sorted_items:
         idx = item.get("index")
-        title = item.get("title", f"섹션 {idx}")
+        title = item.get("title", f"Section {idx}")
         period = item.get("target_period", "")
-        body = completed.get(idx, "_(섹션 누락)_")
+        body = completed.get(idx, "_(Section missing)_")
         warn = ""
         if idx in unverified:
             warn = (
-                "> ⚠️ **검증 미완료 섹션** — 자동 팩트체크 3회 실패. 원본 데이터 대조 필요.\n\n"
+                "> ⚠️ **Unverified Section** — Automatic fact-check failed 3 times. "
+                "Manual data verification required.\n\n"
             )
-        parts.append(f"\n## {title}  \n_대상 기간: {period}_\n\n{warn}{body}\n")
-    # 감사 로그
+        parts.append(f"\n## {title}  \n_Target period: {period}_\n\n{warn}{body}\n")
     if unverified:
-        parts.append("\n---\n\n### 감사 로그\n")
-        parts.append(f"- 검증 미완료 섹션 인덱스: {sorted(unverified)}\n")
+        parts.append("\n---\n\n### Audit Log\n")
+        parts.append(f"- Unverified section indices: {sorted(unverified)}\n")
     return "".join(parts)
 
 
 def format_events_for_prompt(events: List[Dict]) -> str:
-    """이벤트 리스트를 프롬프트용 텍스트로 변환."""
+    """Convert event list to prompt-ready text (English labels)."""
     if not events:
-        return "(데이터 없음)"
+        return "(No data)"
     lines = []
     for ev in events:
-        lines.append(f"- [{ev['date']}] 이슈: {ev['issue']} / 조치: {ev['action']}")
+        lines.append(f"- [{ev['date']}] Issue: {ev['issue']} / Action: {ev['action']}")
     return "\n".join(lines)
 
 
 # ────────────────────────────────────────────────────────────
-# 문서 분할 (504 대응 — 섹션별 윈문/검수용)
+# Document Splitting (for section-by-section polish/verify/translate)
 # ────────────────────────────────────────────────────────────
 _SECTION_RE = re.compile(r'(?=\n## )')
 
 
 def split_compiled_by_section(compiled: str):
-    """compile_sections 결과물을 (문서 헤더, 섹션 리스트, 감사 로그) 로 분리.
+    """Split compile_sections output into (doc_header, sections, audit_log).
 
     Returns:
-        doc_header (str): "# 종합 백서\n" 등 문서 제목부
-        sections (List[str]): ["\n## Title  \n_대상 기간: ..._\n\nbody\n", ...]
-        audit_log (str): "\n---\n\n### 감사 로그\n..." 또는 ""
+        doc_header (str): "# Comprehensive Whitepaper\\n" etc.
+        sections (List[str]): ["\\n## Title  \\n_Target period: ..._\\n\\nbody\\n", ...]
+        audit_log (str): "\\n---\\n\\n### Audit Log\\n..." or ""
     """
-    # 감사 로그 분리
     audit = ""
     audit_sep = "\n---\n"
     pos = compiled.rfind(audit_sep)
-    if pos >= 0 and "수행감사 로그" in compiled[pos:] or pos >= 0 and "### 감사 로그" in compiled[pos:]:
+    if pos >= 0 and "### Audit Log" in compiled[pos:]:
         audit = compiled[pos:]
         compiled = compiled[:pos]
 
@@ -128,19 +117,98 @@ def split_compiled_by_section(compiled: str):
 
 
 def split_section_header_body(section: str):
-    """섹션 텍스트에서 헤더(## 제목 + _대상 기간_)와 본문을 분리.
+    """Separate section header (## title + _period_) from body text.
 
     Returns:
-        header (str): "\n## Title  \n_대상 기간: YYYY-MM_\n\n"
-        body (str): "본문 텍스트..."
+        header (str): "\\n## Title  \\n_Target period: YYYY-MM_\\n\\n"
+        body (str): "body text..."
     """
-    # 기간 라인 이후의 첫 빈 줄에서 분리
-    match = re.search(r'(_대상 기간:.*?_)\n\n', section)
+    match = re.search(r'(_Target period:.*?_)\n\n', section)
     if match:
         split_pos = match.end()
         return section[:split_pos], section[split_pos:]
-    # 폴백: 첫 번째 빈 줄에서 분리
     idx = section.find('\n\n')
     if idx >= 0:
         return section[:idx + 2], section[idx + 2:]
     return section, ""
+
+
+# ────────────────────────────────────────────────────────────
+# Proper Noun Extraction (for translation preservation)
+# ────────────────────────────────────────────────────────────
+
+# Common English words that appear capitalized at sentence start
+# but are NOT proper nouns. Lowercase for case-insensitive matching.
+_COMMON_WORDS: Set[str] = {
+    "the", "this", "that", "these", "those", "there", "then", "thus",
+    "however", "moreover", "furthermore", "therefore", "although",
+    "because", "since", "while", "after", "before", "during",
+    "until", "unless", "whether", "where", "when", "what", "which",
+    "who", "whom", "how", "why", "and", "but", "or", "not", "all",
+    "each", "every", "some", "any", "no", "most", "many", "few",
+    "several", "both", "other", "another", "such", "new", "old",
+    "first", "last", "next", "same", "different", "may", "can",
+    "will", "should", "could", "would", "must", "need", "key",
+    "section", "summary", "report", "period", "phase", "step",
+    "note", "warning", "result", "total", "data", "event", "issue",
+    "action", "date", "month", "year", "day", "time", "also",
+    "with", "from", "into", "about", "over", "under", "through",
+    "between", "against", "without", "within", "along", "across",
+    "behind", "beyond", "plus", "except", "for", "was", "were",
+    "been", "being", "have", "has", "had", "having", "did", "does",
+    "doing", "done", "made", "make", "take", "taken", "took",
+    "give", "given", "gave", "set", "put", "keep", "kept", "let",
+    "began", "begin", "beginning", "end", "ended", "ending",
+    "include", "included", "including", "shown", "show", "showed",
+    "based", "focus", "focused", "major", "main", "primary",
+    "secondary", "critical", "important", "significant", "successful",
+    "comprehensive", "overall", "specific", "particular", "general",
+    "additional", "further", "related", "relevant", "ongoing",
+    "initial", "final", "previous", "current", "future", "potential",
+    "proposed", "required", "necessary", "available", "possible",
+    "effective", "various", "certain", "entire", "complete", "full",
+    "whole", "target", "source", "original", "following", "above",
+    "below", "here", "per", "via", "its", "their", "our", "your",
+    "his", "her", "they", "we", "you", "it", "is", "are", "an",
+    "of", "in", "on", "at", "to", "by", "as", "if",
+}
+
+
+def extract_proper_nouns(text: str) -> List[str]:
+    """Extract candidate proper nouns from English text for translation preservation.
+
+    Heuristic-based — conservative (may include false positives, which is
+    acceptable since over-preservation is safer than under-preservation).
+    """
+    candidates: set = set()
+
+    # 1. Dates (YYYY-MM-DD, YYYY-MM)
+    candidates.update(re.findall(r'\d{4}-\d{2}-\d{2}', text))
+    candidates.update(re.findall(r'\b\d{4}-\d{2}(?!\d)', text))
+
+    # 2. Acronyms (2+ uppercase, possibly with hyphens/numbers)
+    candidates.update(re.findall(r'\b[A-Z][A-Z0-9]{1,}(?:-[A-Z0-9]+)*\b', text))
+
+    # 3. CamelCase words (e.g., GitHub, FastAPI, LangGraph)
+    candidates.update(re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b', text))
+
+    # 4. Capitalized words mid-sentence (after lowercase/comma/semicolon)
+    for m in re.finditer(r'(?<=[a-z,;:]\s)([A-Z][a-z]{2,})', text):
+        word = m.group(1)
+        if word.lower() not in _COMMON_WORDS:
+            candidates.add(word)
+
+    # 5. Multi-word capitalized phrases (e.g., "Task Scheduler", "Rate Limiter")
+    for m in re.finditer(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', text):
+        phrase = m.group(1)
+        words = phrase.split()
+        if any(w.lower() not in _COMMON_WORDS for w in words):
+            candidates.add(phrase)
+
+    # 6. Numbers with units
+    candidates.update(re.findall(r'\d+(?:\.\d+)?\s*(?:%|KB|MB|GB|TB|ms|rpm|RPM)', text))
+
+    # 7. Backtick-quoted tokens (often code/identifiers in markdown)
+    candidates.update(re.findall(r'`([^`]+)`', text))
+
+    return sorted(c for c in candidates if len(c) >= 2)

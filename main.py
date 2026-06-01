@@ -28,9 +28,7 @@ from src.nodes import LOCAL_DATA_PATH
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--format", choices=["whitepaper", "status_report"],
-                   default="whitepaper", help="출력 포맷")
+    p = argparse.ArgumentParser(description="Deep Doc Pipeline — Whitepaper Generator (EN→KR)")
     p.add_argument("--output", default="./output.md", help="최종 마크다운 저장 경로")
     return p.parse_args()
 
@@ -45,7 +43,7 @@ def main():
         sys.exit(1)
 
     print("=" * 70)
-    print(f"파이프라인 시작: target_format={args.format}")
+    print("파이프라인 시작: whitepaper (EN→KR)")
     print(f"모델: {os.getenv('MODEL_NAME', 'gpt-oss:20b')} @ "
           f"{os.getenv('OPENAI_BASE_URL', 'http://localhost:11434/v1')}")
     print("=" * 70)
@@ -53,7 +51,6 @@ def main():
     graph = build_graph()
 
     initial_state = {
-        "target_format": args.format,
         "raw_docs": [],
         "extracted_events": [],
         "period_summaries": {},
@@ -63,6 +60,8 @@ def main():
         "outline_retry_count": 0,
         "section_retry_count": 0,
         "polish_retry_count": 0,
+        "proper_nouns": [],
+        "translation_retry_count": 0,
     }
 
     # recursion_limit를 충분히 늘려 루프 동작 보장
@@ -76,12 +75,16 @@ def main():
     print(f"완료. 결과: {out_path.resolve()}")
     print(f"  - 추출 이벤트: {len(final_state.get('extracted_events', []))}건")
     print(f"  - 월별 그룹: {list(final_state.get('grouped_chunks', {}).keys())}")
-    if args.format == "whitepaper":
-        print(f"  - 목차 항목: {len(final_state.get('outline', []))}개")
-        print(f"  - 완성 섹션: {len(final_state.get('completed_sections', {}))}개")
-        unv = final_state.get("unverified_sections", [])
-        if unv:
-            print(f"  - ⚠️ 검증 미완료 섹션: {sorted(unv)}")
+    print(f"  - 목차 항목: {len(final_state.get('outline', []))}개")
+    print(f"  - 완성 섹션: {len(final_state.get('completed_sections', {}))}개")
+    unv = final_state.get("unverified_sections", [])
+    if unv:
+        print(f"  - ⚠️ 검증 미완료 섹션: {sorted(unv)}")
+    nouns = final_state.get("proper_nouns", [])
+    print(f"  - 추출 고유명사: {len(nouns)}개")
+    if final_state.get("english_output"):
+        print(f"  - 영문 백서: {len(final_state['english_output'])} chars")
+        print(f"  - 한글 번역: {len(final)} chars")
     print("=" * 70)
 
 

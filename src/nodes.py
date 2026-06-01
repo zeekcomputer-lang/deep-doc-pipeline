@@ -1,5 +1,11 @@
 """
-LangGraph 노드 함수들. One Node = One Task 원칙 엄격 준수.
+LangGraph node functions. One Node = One Task principle strictly enforced.
+
+v1.3 changes:
+  - All LLM prompts forced to English output with proper noun preservation.
+  - Whitepaper-only (status_report mode and route_by_target removed).
+  - Translation stage added: prepare_translation → translate → translation_checker.
+  - route_final_check now routes to prepare_translation instead of END.
 """
 from __future__ import annotations
 import json
@@ -13,12 +19,14 @@ from .schemas import (
     ExtractedEvent, PeriodSummary, GlobalTheme,
     Outline, OutlineCritique,
     SectionDraft, FactCheckResult, PolishedDocument,
+    TranslationCheckResult,
 )
 from .llm import structured_call
 from .utils import (
     is_valid_date, chrono_sort_and_group, filter_by_period,
     validate_outline_periods, compile_sections, format_events_for_prompt,
     split_compiled_by_section, split_section_header_body,
+    extract_proper_nouns,
 )
 from .context_guard import (
     BUDGET_BYTES, fits_budget, estimate_guard_overhead, available_data_budget,
@@ -29,11 +37,21 @@ from .context_guard import (
 
 LOCAL_DATA_PATH = "./data/records.jsonl"
 
+# ══════════════════════════════════════════════════════════════
+# Common English enforcement suffix appended to key system prompts
+# ══════════════════════════════════════════════════════════════
+_EN_ENFORCE = (
+    " Respond in English only. "
+    "Preserve all proper nouns (company names, project names, personal names, "
+    "place names, technical terms, abbreviations) in their original form."
+)
+
+
 # ──────────────────────────────────────────────────────────────
-# Phase 1: 추출
+# Phase 1: Extraction
 # ──────────────────────────────────────────────────────────────
 def load_docs_node(state: GraphState) -> Dict[str, Any]:
-    """JSONL 파일을 읽어 raw_docs에 적재."""
+    """Load JSONL file into raw_docs."""
     docs: List[Dict] = []
     failed = 0
     path = Path(LOCAL_DATA_PATH)
@@ -52,7 +70,7 @@ def load_docs_node(state: GraphState) -> Dict[str, Any]:
 
 
 def fanout_to_extractor(state: GraphState):
-    """Send API로 strict_extractor_node를 문서별 병렬 실행."""
+    """Dispatch strict_extractor_node per document via Send API."""
     return [
         Send("strict_extractor", {"doc": d, "doc_index": i})
         for i, d in enumerate(state["raw_docs"])
@@ -61,20 +79,23 @@ def fanout_to_extractor(state: GraphState):
 
 def strict_extractor_node(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    단일 문서에서 ExtractedEvent 추출.
-    structured_call 내부에 3회 재시도 내장.
-    v1.2: 95KB 예산 초과 시 doc_text 자동 절단.
+    Extract ExtractedEvent from a single document.
+    3-retry built into structured_call.
+    v1.2: Auto-truncate doc_text if 95KB budget exceeded.
+    v1.3: English output enforced.
     """
     doc = payload["doc"]
     idx = payload["doc_index"]
     doc_text = json.dumps(doc, ensure_ascii=False)
 
     system_content = (
-        "너는 문서 분석가다. 주어진 원본 문서에서 핵심 사실을 추출하라. "
-        "date는 반드시 YYYY-MM-DD 형식. 원본에 명시되지 않은 정보는 절대 만들지 마라."
+        "You are a document analyst. Extract key facts from the given source document. "
+        "The date field MUST be in YYYY-MM-DD format. "
+        "NEVER fabricate information not explicitly stated in the source."
+        + _EN_ENFORCE
     )
-    user_prefix = "원본 문서:\n"
-    user_suffix = "\n\n위 문서에서 date/issue/action을 추출하라."
+    user_prefix = "Source document:\n"
+    user_suffix = "\n\nExtract date/issue/action from the above document."
 
     def _build_messages(text: str) -> list:
         return [
@@ -87,7 +108,7 @@ def strict_extractor_node(payload: Dict[str, Any]) -> Dict[str, Any]:
     size = measure_messages_bytes(messages) + guard_overhead
 
     if size > BUDGET_BYTES:
-        excess = size - BUDGET_BYTES + 512  # 512 안전 마진
+        excess = size - BUDGET_BYTES + 512
         doc_bytes = doc_text.encode("utf-8")
         allowed = max(len(doc_bytes) - excess, 256)
         doc_text = doc_bytes[:allowed].decode("utf-8", errors="ignore") + " [TRUNCATED]"
@@ -106,17 +127,17 @@ def strict_extractor_node(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def chrono_sorter_node(state: GraphState) -> Dict[str, Any]:
-    """Pure Python 정렬 + 월별 그룹핑."""
+    """Pure Python sort + monthly grouping."""
     grouped = chrono_sort_and_group(state["extracted_events"])
     print(f"[chrono_sorter] events={len(state['extracted_events'])} months={list(grouped.keys())}")
     return {"grouped_chunks": grouped}
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 2: 마이크로 요약
+# Phase 2: Micro Summaries
 # ──────────────────────────────────────────────────────────────
 def fanout_to_period_summarizer(state: GraphState):
-    """월별 병렬 요약."""
+    """Parallel monthly summaries via Send API."""
     return [
         Send("period_summarizer", {"period": p, "events": evs})
         for p, evs in state["grouped_chunks"].items()
@@ -124,17 +145,19 @@ def fanout_to_period_summarizer(state: GraphState):
 
 
 def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """월별 핵심 동향 3문장 요약.
-    v1.2: 95KB 예산 초과 시 이벤트 배치 분할 후 서브 요약 병합.
+    """Monthly key trend summary in exactly 3 sentences.
+    v1.2: Budget-aware batch splitting + sub-summary merging.
+    v1.3: English output enforced.
     """
     period = payload["period"]
     events = payload["events"]
 
     system_content = (
-        "너는 시기별 동향 분석가다. 주어진 이벤트 목록을 보고 정확히 3문장으로 핵심 동향을 요약하라. "
-        "이벤트에 없는 내용은 추가하지 마라."
+        "You are a period trend analyst. Summarize the given event list into exactly "
+        "3 sentences capturing the key trends. Do NOT add content not present in the events."
+        + _EN_ENFORCE
     )
-    user_template = "기간: {period}\n\n이벤트 목록:\n{events_text}\n\n3문장 요약:"
+    user_template = "Period: {period}\n\nEvent list:\n{events_text}\n\n3-sentence summary:"
 
     def _build_messages(events_text: str) -> list:
         return [
@@ -152,7 +175,7 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         print(f"[period_summarizer] {period}: {result.summary[:60]}...")
         return {"period_summaries": {period: result.summary}}
 
-    # 예산 초과 — 배치 분할
+    # Budget exceeded — batch split
     data_budget = available_data_budget(
         system_content,
         PeriodSummary.model_json_schema(),
@@ -168,14 +191,19 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         sub = structured_call(batch_msgs, PeriodSummary, role="default", temperature=0.2)
         sub_summaries.append(sub.summary)
 
-    # 서브 요약 병합
-    merged_input = "\n".join(f"[부분 요약 {i+1}] {s}" for i, s in enumerate(sub_summaries))
+    # Merge sub-summaries
+    merged_input = "\n".join(f"[Partial summary {i+1}] {s}" for i, s in enumerate(sub_summaries))
     merge_messages = [
         {"role": "system", "content": (
-            "너는 요약 병합 전문가다. 동일 기간의 부분 요약들을 정보 손실 없이 "
-            "하나의 통합 요약으로 병합하라. 부분 요약에 없는 내용은 추가하지 마라. 정확히 3문장."
+            "You are a summary merger. Combine partial summaries for the same period "
+            "into one unified summary without information loss. "
+            "Do NOT add content not present in the partial summaries. Exactly 3 sentences."
+            + _EN_ENFORCE
         )},
-        {"role": "user", "content": f"기간: {period}\n\n부분 요약 목록:\n{merged_input}\n\n통합 3문장 요약:"},
+        {"role": "user", "content": (
+            f"Period: {period}\n\nPartial summaries:\n{merged_input}\n\n"
+            "Unified 3-sentence summary:"
+        )},
     ]
     merged = structured_call(merge_messages, PeriodSummary, role="default", temperature=0.2)
     print(f"[period_summarizer] {period}: merged summary: {merged.summary[:60]}...")
@@ -183,15 +211,18 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def theme_analyzer_node(state: GraphState) -> Dict[str, Any]:
-    """전체 흐름 1문단 도출.
-    v1.2: 예산 초과 시 오래된 월별 요약부터 순차 제거.
+    """Derive overall theme in 1 paragraph.
+    v1.2: Drops oldest monthly summaries if budget exceeded.
+    v1.3: English output enforced.
     """
     summaries = state["period_summaries"]
     sorted_periods = sorted(summaries.keys())
 
     system_content = (
-        "너는 거시 분석가다. 월별 요약을 모아 전체 프로젝트의 성과와 위기 흐름을 관통하는 통찰을 "
-        "정확히 1문단으로 작성하라. 요약에 없는 내용은 추가하지 마라."
+        "You are a macro analyst. Given monthly summaries, write exactly 1 paragraph "
+        "capturing the overarching insight into the project's performance and risk trajectory. "
+        "Do NOT add content not present in the summaries."
+        + _EN_ENFORCE
     )
 
     def _make_joined(periods: list) -> str:
@@ -200,7 +231,7 @@ def theme_analyzer_node(state: GraphState) -> Dict[str, Any]:
     def _build_messages(joined: str) -> list:
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": f"월별 요약:\n{joined}\n\n전체 흐름 1문단:"},
+            {"role": "user", "content": f"Monthly summaries:\n{joined}\n\nOverall theme (1 paragraph):"},
         ]
 
     active_periods = list(sorted_periods)
@@ -209,7 +240,6 @@ def theme_analyzer_node(state: GraphState) -> Dict[str, Any]:
     guard_overhead = estimate_guard_overhead(GlobalTheme.model_json_schema())
     size = measure_messages_bytes(messages) + guard_overhead
 
-    # 오래된 월부터 제거하며 예산 맞추기
     while size > BUDGET_BYTES and len(active_periods) > 1:
         removed = active_periods.pop(0)
         print(f"[theme_analyzer] budget exceeded — removing oldest period: {removed}")
@@ -223,41 +253,12 @@ def theme_analyzer_node(state: GraphState) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 3: 라우터
-# ──────────────────────────────────────────────────────────────
-def route_by_target(state: GraphState) -> str:
-    target = state.get("target_format", "whitepaper")
-    return "status_report" if target == "status_report" else "whitepaper"
-
-
-# ──────────────────────────────────────────────────────────────
-# Phase 4-A: 현황판
-# ──────────────────────────────────────────────────────────────
-def status_formatter_node(state: GraphState) -> Dict[str, Any]:
-    """Pure Python 마크다운 조립 — 현황판은 LLM 없이도 충분."""
-    grouped = state["grouped_chunks"]
-    summaries = state["period_summaries"]
-    theme = state.get("global_theme", "")
-
-    parts: List[str] = ["# 현황판 리포트\n\n"]
-    parts.append(f"## 전체 흐름\n\n{theme}\n\n")
-    parts.append("## 월별 동향\n\n")
-    for period in sorted(grouped.keys()):
-        parts.append(f"### {period}\n")
-        parts.append(f"**요약:** {summaries.get(period, '(요약 없음)')}\n\n")
-        parts.append("**이벤트:**\n")
-        for ev in grouped[period]:
-            parts.append(f"- `{ev['date']}` {ev['issue']} → {ev['action']}\n")
-        parts.append("\n")
-    return {"final_output": "".join(parts)}
-
-
-# ──────────────────────────────────────────────────────────────
-# Phase 4-B [1단계]: 기획 검증 루프
+# Phase 4-B [Step 1]: Planning Validation Loop
 # ──────────────────────────────────────────────────────────────
 def draft_planner_node(state: GraphState) -> Dict[str, Any]:
-    """global_theme + period_summaries만으로 목차 기획.
-    v1.2: 예산 초과 시 summaries 각 항목 100자로 절단.
+    """Plan whitepaper outline from global_theme + period_summaries.
+    v1.2: Truncates summaries if budget exceeded.
+    v1.3: English output enforced.
     """
     theme = state["global_theme"]
     summaries = state["period_summaries"]
@@ -268,20 +269,25 @@ def draft_planner_node(state: GraphState) -> Dict[str, Any]:
     retry_hint = ""
     if prev_feedback:
         retry_hint = (
-            f"\n\n[이전 목차 반려 사유 — 반드시 반영]\n{prev_feedback}\n"
+            f"\n\n[PREVIOUS OUTLINE REJECTED — address these issues]\n{prev_feedback}\n"
         )
 
     system_content = (
-        "너는 백서 기획자다. 주어진 전체 흐름과 월별 요약만으로 백서의 목차를 작성하라. "
-        "각 목차 항목은 정확히 하나의 'YYYY-MM' 기간을 다뤄야 한다 (target_period). "
-        f"사용 가능한 기간 키: {available_periods}\n"
-        "기간은 반드시 이 목록 중에서만 선택하라. 시계열 순서대로 정렬하라."
+        "You are a whitepaper planner. Create an outline based on the given theme and "
+        "monthly summaries. Each outline item must cover exactly one 'YYYY-MM' period "
+        "(target_period). "
+        f"Available period keys: {available_periods}\n"
+        "Only use periods from this list. Sort in chronological order."
+        + _EN_ENFORCE
     )
 
     def _build_messages(j: str, hint: str) -> list:
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": f"전체 흐름:\n{theme}\n\n월별 요약:\n{j}{hint}\n\n목차 작성:"},
+            {"role": "user", "content": (
+                f"Overall theme:\n{theme}\n\nMonthly summaries:\n{j}{hint}\n\n"
+                "Create outline:"
+            )},
         ]
 
     messages = _build_messages(joined, retry_hint)
@@ -289,7 +295,6 @@ def draft_planner_node(state: GraphState) -> Dict[str, Any]:
     size = measure_messages_bytes(messages) + guard_overhead
 
     if size > BUDGET_BYTES:
-        # 요약 내용을 앞 100자로 절단
         truncated_joined = "\n".join(
             f"[{k}] {v[:100]}..." for k, v in sorted(summaries.items())
         )
@@ -305,17 +310,18 @@ def draft_planner_node(state: GraphState) -> Dict[str, Any]:
 
 def planner_critique_node(state: GraphState) -> Dict[str, Any]:
     """
-    목차 검수: 시계열 흐름 + target_period 존재성 검증.
-    target_period 존재성은 Python으로 결정론적 검증 (LLM 환각 차단).
-    v1.2: LLM 호출 전 예산 확인, 초과 시 outline intent 절단.
+    Outline review: chronological flow + target_period existence validation.
+    Python validates target_period deterministically (blocks LLM hallucination).
+    v1.2: Budget check before LLM call, intent truncation if exceeded.
+    v1.3: English output enforced.
     """
     outline = state["outline"]
     grouped = state["grouped_chunks"]
 
-    # Python 검증 1: target_period 존재성
+    # Python validation 1: target_period existence
     invalid_periods = validate_outline_periods(outline, grouped)
     if invalid_periods:
-        msg = f"존재하지 않는 target_period 사용: {invalid_periods}"
+        msg = f"Non-existent target_period used: {invalid_periods}"
         print(f"[planner_critique] REJECTED (python): {msg}")
         return {
             "is_outline_approved": False,
@@ -323,10 +329,10 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
             "outline_retry_count": state.get("outline_retry_count", 0) + 1,
         }
 
-    # Python 검증 2: 시계열 정렬
+    # Python validation 2: chronological order
     periods = [it["target_period"] for it in outline]
     if periods != sorted(periods):
-        msg = f"시계열 순서 위반. 현재 순서: {periods}"
+        msg = f"Chronological order violation. Current order: {periods}"
         print(f"[planner_critique] REJECTED (python): {msg}")
         return {
             "is_outline_approved": False,
@@ -334,10 +340,12 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
             "outline_retry_count": state.get("outline_retry_count", 0) + 1,
         }
 
-    # LLM 검수: 구성의 합리성
+    # LLM review: structural reasonableness
     system_content = (
-        "너는 깐깐한 기획 검수자다. 주어진 목차가 백서로서 자연스러운 흐름인지 평가하라. "
-        "각 섹션 의도가 명확하고 중복이 없으면 승인. 문제 있으면 구체적 사유 제시."
+        "You are a strict planning reviewer. Evaluate whether the given outline forms "
+        "a natural whitepaper flow. Approve if each section intent is clear and there are "
+        "no duplications. If issues exist, provide specific reasons."
+        + _EN_ENFORCE
     )
 
     def _make_outline_text(items: list) -> str:
@@ -349,7 +357,7 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
     def _build_messages(outline_text: str) -> list:
         return [
             {"role": "system", "content": system_content},
-            {"role": "user", "content": f"목차:\n{outline_text}\n\n검수 결과:"},
+            {"role": "user", "content": f"Outline:\n{outline_text}\n\nReview result:"},
         ]
 
     outline_text = _make_outline_text(outline)
@@ -358,7 +366,6 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
     size = measure_messages_bytes(messages) + guard_overhead
 
     if size > BUDGET_BYTES:
-        # intent 필드 앞 80자로 절단
         truncated = [
             {**it, "intent": it["intent"][:80] + "..." if len(it["intent"]) > 80 else it["intent"]}
             for it in outline
@@ -371,12 +378,12 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
     retry = state.get("outline_retry_count", 0) + (0 if result.is_outline_approved else 1)
     print(f"[planner_critique] approved={result.is_outline_approved} retry={retry}")
 
-    # Fail-Safe: 3회 초과 시 강제 통과
+    # Fail-Safe: force pass after 3 retries
     if not result.is_outline_approved and retry >= 3:
-        print("[planner_critique] FAIL-SAFE: 강제 통과 (재시도 3회 초과)")
+        print("[planner_critique] FAIL-SAFE: forced pass (3+ retries)")
         return {
             "is_outline_approved": True,
-            "outline_feedback": f"[강제통과] {result.feedback}",
+            "outline_feedback": f"[FORCED PASS] {result.feedback}",
             "outline_retry_count": retry,
         }
 
@@ -392,10 +399,10 @@ def route_outline(state: GraphState) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 4-B [2단계]: 집필 + 팩트체크 루프
+# Phase 4-B [Step 2]: Writing + Fact-check Loop
 # ──────────────────────────────────────────────────────────────
 def init_writing_node(state: GraphState) -> Dict[str, Any]:
-    """집필 루프 초기화."""
+    """Initialize writing loop."""
     return {
         "current_section_index": 0,
         "section_retry_count": 0,
@@ -406,21 +413,19 @@ def init_writing_node(state: GraphState) -> Dict[str, Any]:
 
 def section_writer_node(state: GraphState) -> Dict[str, Any]:
     """
-    v1.2: 재작성 시 previous_draft + hallucinated_tokens를 명시 주입.
-          95KB 예산 초과 시 이벤트 배치 분할 후 부분 초안 병합.
+    v1.2: Injects previous_draft + hallucinated_tokens on rewrite.
+          Budget-aware batch splitting with partial draft merging.
+    v1.3: English output enforced with proper noun preservation.
     """
     outline = state["outline"]
     idx = state["current_section_index"]
     item = outline[idx]
     period = item["target_period"]
     grouped = state["grouped_chunks"]
-
-    # Pure Python 컨텍스트 컷오프
     events = filter_by_period(grouped, period)
-
     retry = state.get("section_retry_count", 0)
 
-    # Step 1: retry extras 빌드 (trim_retry_context 적용)
+    # Step 1: Build retry extras
     extra = ""
     if retry > 0:
         prev = state.get("previous_draft", "")
@@ -430,22 +435,24 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
             prev, feedback, bad_tokens, budget_bytes=20 * 1024
         )
         extra = (
-            f"\n\n[직전 반려 초안 — 절대 동일하게 작성하지 마라]\n{prev}\n"
-            f"\n[사용 금지 토큰 — 원본에 없는 환각]\n{bad_tokens}\n"
-            f"\n[수정 지시사항]\n{feedback}\n"
+            f"\n\n[PREVIOUS REJECTED DRAFT — DO NOT repeat this]\n{prev}\n"
+            f"\n[BANNED TOKENS — hallucinated terms not in source]\n{bad_tokens}\n"
+            f"\n[REVISION INSTRUCTIONS]\n{feedback}\n"
         )
 
     system_content = (
-        "너는 백서 집필자다. 오직 제공된 원본 이벤트 데이터만을 근거로 섹션을 작성하라. "
-        "원본에 없는 고유명사, 날짜, 수치를 절대 만들지 마라. 마크다운 본문만 출력."
+        "You are a whitepaper writer. Write the section using ONLY the provided source "
+        "event data as evidence. NEVER fabricate proper nouns, dates, or numbers not in "
+        "the source. Output markdown body only."
+        + _EN_ENFORCE
     )
     user_prefix = (
-        f"섹션 제목: {item['title']}\n"
-        f"대상 기간: {period}\n"
-        f"전달 의도: {item['intent']}\n\n"
-        f"원본 이벤트 (이 데이터만 사용):\n"
+        f"Section title: {item['title']}\n"
+        f"Target period: {period}\n"
+        f"Key message: {item['intent']}\n\n"
+        f"Source events (use ONLY this data):\n"
     )
-    user_suffix = f"{extra}\n\n섹션 본문 작성:"
+    user_suffix = f"{extra}\n\nWrite section body:"
 
     def _build_messages(events_text: str) -> list:
         return [
@@ -453,21 +460,17 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
             {"role": "user", "content": f"{user_prefix}{events_text}{user_suffix}"},
         ]
 
-    # Step 2: 전체 이벤트로 messages 빌드
     events_text = format_events_for_prompt(events)
     messages = _build_messages(events_text)
-
-    # Step 3: 예산 확인 (가드 오버헤드 포함)
     guard_overhead = estimate_guard_overhead(SectionDraft.model_json_schema())
     size = measure_messages_bytes(messages) + guard_overhead
 
     if size <= BUDGET_BYTES:
-        # 예산 내 — 정상 호출
         result = structured_call(messages, SectionDraft, role="writer", temperature=0.3)
         print(f"[section_writer] idx={idx} period={period} retry={retry} len={len(result.content)}")
         return {"current_draft": result.content}
 
-    # 예산 초과 — 배치 분할
+    # Budget exceeded — batch split
     data_budget = available_data_budget(
         system_content,
         SectionDraft.model_json_schema(),
@@ -477,8 +480,10 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
     print(f"[section_writer] idx={idx} budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
 
     partial_system = (
-        "너는 백서 집필자다. 제공된 이벤트의 핵심 내용을 본문으로 작성하라. "
-        "원본에 없는 정보 추가 금지. 이 이벤트는 전체의 일부이며, 나중에 병합된다."
+        "You are a whitepaper writer. Write body text covering the key content of the "
+        "provided events. Do NOT add information not in the source. "
+        "This is a partial batch — content will be merged later."
+        + _EN_ENFORCE
     )
     partial_drafts: List[str] = []
     for batch in batches:
@@ -486,27 +491,28 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         batch_msgs = [
             {"role": "system", "content": partial_system},
             {"role": "user", "content": (
-                f"섹션 제목: {item['title']}\n"
-                f"대상 기간: {period}\n\n"
-                f"원본 이벤트 (이 배치):\n{batch_text}{user_suffix}"
+                f"Section title: {item['title']}\n"
+                f"Target period: {period}\n\n"
+                f"Source events (this batch):\n{batch_text}{user_suffix}"
             )},
         ]
         part = structured_call(batch_msgs, SectionDraft, role="writer", temperature=0.3)
         partial_drafts.append(part.content)
 
-    # 부분 초안 병합
+    # Merge partial drafts
     merge_input = "\n\n---\n\n".join(
-        f"[부분 초안 {i+1}]\n{d}" for i, d in enumerate(partial_drafts)
+        f"[Partial draft {i+1}]\n{d}" for i, d in enumerate(partial_drafts)
     )
     merge_msgs = [
         {"role": "system", "content": (
-            "너는 백서 편집자다. 동일 섹션의 부분 초안들을 하나의 매끄러운 본문으로 병합하라. "
-            "각 부분 초안의 사실 정보를 빠짐없이 포함하라. 새로운 정보를 추가하지 마라. "
-            "중복은 제거하되 유의미한 디테일은 보존하라."
+            "You are a whitepaper editor. Merge partial drafts for the same section into "
+            "one smooth body text. Include all factual information from each partial draft. "
+            "Do NOT add new information. Remove duplicates but preserve meaningful details."
+            + _EN_ENFORCE
         )},
         {"role": "user", "content": (
-            f"섹션 제목: {item['title']}\n\n"
-            f"부분 초안들:\n{merge_input}\n\n통합 본문 작성:"
+            f"Section title: {item['title']}\n\n"
+            f"Partial drafts:\n{merge_input}\n\nMerged body:"
         )},
     ]
     merge_guard = estimate_guard_overhead(SectionDraft.model_json_schema())
@@ -516,7 +522,6 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         merged = structured_call(merge_msgs, SectionDraft, role="writer", temperature=0.3)
         content = merged.content
     else:
-        # 병합 자체도 예산 초과 — 단순 연결 폴백
         print(f"[section_writer] idx={idx} merge also exceeded budget — concatenating")
         content = "\n\n".join(partial_drafts)
 
@@ -526,8 +531,9 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
 
 def fact_checker_node(state: GraphState) -> Dict[str, Any]:
     """
-    v1.2: hallucinated_terms 강제 추출.
-          예산 초과 시 이벤트 배치 분할 + cross_check_terms로 최종 판정.
+    v1.2: Mandatory hallucinated_terms extraction.
+          Budget-aware batch splitting + cross_check_terms.
+    v1.3: English output enforced.
     """
     outline = state["outline"]
     idx = state["current_section_index"]
@@ -539,18 +545,19 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
     draft = state["current_draft"]
 
     system_content = (
-        "너는 매우 깐깐한 감사관이다. 초안에 원본 데이터에 없는 고유명사, 날짜, 수치가 "
-        "하나라도 등장하면 무조건 is_draft_approved=False를 반환하라. "
-        "동시에 환각으로 판단되는 정확한 토큰 리스트를 hallucinated_terms 필드에 추출하라. "
-        "feedback에는 구체적으로 어느 부분이 문제인지 명시하라."
+        "You are a strict auditor. If the draft contains ANY proper noun, date, or number "
+        "not present in the source events, you MUST set is_draft_approved=False. "
+        "Extract the exact hallucinated tokens into the hallucinated_terms list. "
+        "In feedback, specify exactly which parts are problematic."
+        + _EN_ENFORCE
     )
 
     def _build_messages(ev_text: str) -> list:
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": (
-                f"원본 이벤트 (이것만이 진실):\n{ev_text}\n\n"
-                f"검수 대상 초안:\n{draft}\n\n검수 결과:"
+                f"Source events (ground truth):\n{ev_text}\n\n"
+                f"Draft under review:\n{draft}\n\nVerification result:"
             )},
         ]
 
@@ -559,7 +566,6 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
     size = measure_messages_bytes(messages) + guard_overhead
 
     if size <= BUDGET_BYTES:
-        # 예산 내 — 정상 호출
         result = structured_call(messages, FactCheckResult, role="judge", temperature=0.0)
         print(f"[fact_checker] idx={idx} approved={result.is_draft_approved} "
               f"halluc={result.hallucinated_terms[:3]}")
@@ -569,19 +575,20 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
             "hallucinated_tokens": result.hallucinated_terms if not result.is_draft_approved else [],
         }
 
-    # 예산 초과 — 이벤트 배치 분할 (draft는 각 배치에 유지)
+    # Budget exceeded — batch split events (draft kept in each batch)
     data_budget = available_data_budget(
         system_content,
         FactCheckResult.model_json_schema(),
-        extra_fixed=f"원본 이벤트 (이것만이 진실):\n\n\n검수 대상 초안:\n{draft}\n\n검수 결과:",
+        extra_fixed=f"Source events (ground truth):\n\n\nDraft under review:\n{draft}\n\nVerification result:",
     )
     batches = split_items_for_budget(events, format_events_for_prompt, data_budget)
 
     batched_system = (
-        "너는 감사관이다. 초안의 내용이 제공된 이벤트 데이터와 일치하는지 검증하라. "
-        "이 이벤트는 전체의 일부이다. 이 배치에 없는 정보가 초안에 있더라도 "
-        "다른 배치에 있을 수 있으므로 hallucinated_terms에 기록하라. "
-        "이 배치의 데이터와 명백히 모순되는 내용만 is_draft_approved=False로 판정하라."
+        "You are an auditor. Verify whether the draft content matches the provided event data. "
+        "These events are a SUBSET of the full data. If information in the draft is absent "
+        "from this batch, record it in hallucinated_terms (it may exist in other batches). "
+        "Only set is_draft_approved=False if the draft clearly CONTRADICTS this batch."
+        + _EN_ENFORCE
     )
 
     all_approved = True
@@ -593,8 +600,8 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
         batch_msgs = [
             {"role": "system", "content": batched_system},
             {"role": "user", "content": (
-                f"원본 이벤트 (이 배치):\n{batch_text}\n\n"
-                f"검수 대상 초안:\n{draft}\n\n검수 결과:"
+                f"Source events (this batch):\n{batch_text}\n\n"
+                f"Draft under review:\n{draft}\n\nVerification result:"
             )},
         ]
         batch_result = structured_call(batch_msgs, FactCheckResult, role="judge", temperature=0.0)
@@ -603,10 +610,10 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
             all_feedback.append(batch_result.feedback)
         all_candidates.extend(batch_result.hallucinated_terms)
 
-    # 교차 검증: 전체 이벤트에 실제 없는 토큰만 환각으로 확정
+    # Cross-check: only truly absent tokens are hallucinations
     truly_hallucinated = cross_check_terms(all_candidates, events)
     is_approved = len(truly_hallucinated) == 0
-    feedback = "; ".join(all_feedback) if all_feedback else "배치 검증 통과"
+    feedback = "; ".join(all_feedback) if all_feedback else "Batch verification passed"
     print(f"[fact_checker] idx={idx} batched: {len(batches)} batches, "
           f"candidates={len(all_candidates)}, truly_halluc={len(truly_hallucinated)}")
 
@@ -619,10 +626,10 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
 
 def route_section_draft(state: GraphState) -> str:
     """
-    v1.1 분기:
+    v1.1 routing:
     - Pass → save_section
-    - Fail & retry < 3 → section_writer (재작성)
-    - Fail & retry >= 3 → save_section_with_warning (강제통과)
+    - Fail & retry < 3 → retry_section (rewrite)
+    - Fail & retry >= 3 → save_section_with_warning (fail-safe)
     """
     if state.get("is_draft_approved"):
         return "save_section"
@@ -632,7 +639,7 @@ def route_section_draft(state: GraphState) -> str:
 
 
 def retry_section_node(state: GraphState) -> Dict[str, Any]:
-    """재작성 준비: previous_draft 갱신 + retry count 증가."""
+    """Prepare rewrite: update previous_draft + increment retry count."""
     return {
         "previous_draft": state.get("current_draft", ""),
         "section_retry_count": state.get("section_retry_count", 0) + 1,
@@ -640,7 +647,7 @@ def retry_section_node(state: GraphState) -> Dict[str, Any]:
 
 
 def save_section_node(state: GraphState) -> Dict[str, Any]:
-    """승인된 섹션 저장 + 인덱스 증가 + 스코프 초기화."""
+    """Save approved section + advance index + reset scope."""
     idx = state["current_section_index"]
     draft = state["current_draft"]
     print(f"[save_section] idx={idx} APPROVED")
@@ -649,18 +656,17 @@ def save_section_node(state: GraphState) -> Dict[str, Any]:
         "current_section_index": idx + 1,
         "section_retry_count": 0,
         "previous_draft": "",
-        # hallucinated_tokens는 누적 reducer라 섹션별 초기화 불가 — writer 측에서 retry==0이면 무시
     }
 
 
 def save_section_with_warning_node(state: GraphState) -> Dict[str, Any]:
-    """Fail-Safe 강제통과: 워터마크 삽입 + unverified_sections 누적."""
+    """Fail-Safe forced pass: watermark + unverified_sections accumulation."""
     idx = state["current_section_index"]
     draft = state["current_draft"]
-    feedback = state.get("draft_feedback", "(사유 미기록)")
+    feedback = state.get("draft_feedback", "(no reason recorded)")
     warned = (
-        f"> ⚠️ **검증 미완료 섹션** — 자동 팩트체크 3회 실패.\n"
-        f"> 마지막 반려 사유: {feedback}\n\n"
+        f"> ⚠️ **Unverified Section** — Automatic fact-check failed 3 times.\n"
+        f"> Last rejection reason: {feedback}\n\n"
         f"{draft}"
     )
     print(f"[save_section_with_warning] idx={idx} FORCE-PASS")
@@ -674,17 +680,17 @@ def save_section_with_warning_node(state: GraphState) -> Dict[str, Any]:
 
 
 def route_next_section(state: GraphState) -> str:
-    """모든 섹션 완료 시 compiler로, 아니면 다음 섹션 집필."""
+    """All sections done → compiler, otherwise next section."""
     if state["current_section_index"] >= len(state["outline"]):
         return "compiler"
     return "section_writer"
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 4-B [3단계]: 조립 → 윤문 → 2차 팩트체크
+# Phase 4-B [Step 3]: Assembly → Polish → 2nd Fact-check
 # ──────────────────────────────────────────────────────────────
 def compiler_node(state: GraphState) -> Dict[str, Any]:
-    """Pure Python — LLM 호출 금지."""
+    """Pure Python assembly — no LLM calls."""
     outline = state["outline"]
     completed = state.get("completed_sections", {})
     unverified = state.get("unverified_sections", [])
@@ -694,9 +700,9 @@ def compiler_node(state: GraphState) -> Dict[str, Any]:
 
 
 def polish_node(state: GraphState) -> Dict[str, Any]:
-    """섹션별 분할 윤문 + 스트리밍. 대용량 컨텍스트 504 타임아웃 방지.
-
-    v1.2: 섹션 단위 예산 초과 시 문단별 분할 윤문 후 재조립.
+    """Section-by-section polishing + streaming. Prevents 504 on large contexts.
+    v1.2: Paragraph-level splitting if section exceeds budget.
+    v1.3: English output enforced.
     """
     compiled = state["final_compiled"]
     retry_count = state.get("polish_retry_count", 0)
@@ -707,10 +713,12 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
         return {"final_output": compiled}
 
     system_prompt = (
-        "너는 교정 편집자다. 입력된 본문의 사실 정보(날짜, 고유명사, 수치, 인과관계)는 "
-        "단 한 글자도 추가/삭제/수정하지 마라. 오직 문단 연결어, 호응, 어색한 문장 흐름만 "
-        "다듬어라. 새로운 정보를 절대 만들지 마라. "
-        "마크다운 구조(헤더, 리스트, 워터마크 블록인용)는 유지하라."
+        "You are a proofreading editor. Do NOT add, delete, or modify any factual "
+        "information (dates, proper nouns, numbers, causal relationships). "
+        "ONLY refine paragraph transitions, coherence, and awkward phrasing. "
+        "NEVER fabricate new information. "
+        "Maintain markdown structure (headers, lists, blockquote warnings)."
+        + _EN_ENFORCE
     )
     guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
 
@@ -723,7 +731,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"본문:\n{body}\n\n윤문 결과:"},
+            {"role": "user", "content": f"Body text:\n{body}\n\nPolished result:"},
         ]
         size = measure_messages_bytes(messages) + guard_overhead
 
@@ -736,7 +744,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
             print(f"[polish] section {i + 1}/{len(sections)} retry={retry_count} "
                   f"len={len(result.content)}")
         else:
-            # 섹션이 예산 초과 — 문단별 분할 윤문
+            # Section exceeds budget — paragraph-level split
             paragraphs = body.split("\n\n")
             polished_paragraphs: List[str] = []
             for para in paragraphs:
@@ -745,7 +753,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
                     continue
                 para_msgs = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"본문:\n{para}\n\n윤문 결과:"},
+                    {"role": "user", "content": f"Body text:\n{para}\n\nPolished result:"},
                 ]
                 para_size = measure_messages_bytes(para_msgs) + guard_overhead
                 if para_size <= BUDGET_BYTES:
@@ -755,7 +763,6 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
                     )
                     polished_paragraphs.append(para_result.content)
                 else:
-                    # 단락도 초과 시 원본 유지
                     polished_paragraphs.append(para)
             polished_body = "\n\n".join(polished_paragraphs)
             polished_sections.append(header + polished_body)
@@ -768,9 +775,9 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
 
 
 def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
-    """섹션별 분할 2차 팩트체크 + 스트리밍. 대용량 컨텍스트 504 타임아웃 방지.
-
-    v1.2: 섹션 쌍별 예산 초과 시 해당 섹션 건너뜀 (승인 처리).
+    """Section-by-section 2nd fact-check + streaming. Prevents 504 on large contexts.
+    v1.2: Skips section pairs exceeding budget (auto-approve).
+    v1.3: English output enforced.
     """
     original = state["final_compiled"]
     polished = state["final_output"]
@@ -780,27 +787,27 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
     _, pol_sections, _ = split_compiled_by_section(polished)
 
     system_prompt = (
-        "너는 최종 감사관이다. 원본과 윤문본을 비교하여 "
-        "고유명사/날짜/수치/사실이 추가되었거나 변형되었는지 검증하라. "
-        "문장 흐름 변화는 허용, 사실 변경만 환각으로 처리하라."
+        "You are the final auditor. Compare the original and polished versions. "
+        "Verify that no proper nouns, dates, numbers, or facts were added or altered. "
+        "Sentence flow changes are allowed; only factual changes count as hallucination."
+        + _EN_ENFORCE
     )
     guard_overhead = estimate_guard_overhead(FactCheckResult.model_json_schema())
 
-    # 섹션 수 불일치 시 전체 문서 비교 폴백 (stream으로 504 방지)
+    # Section count mismatch → full document comparison fallback
     if len(orig_sections) != len(pol_sections) or not orig_sections:
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": (
-                f"[ORIGINAL]\n{original}\n\n[POLISHED]\n{polished}\n\n검증 결과:"
+                f"[ORIGINAL]\n{original}\n\n[POLISHED]\n{polished}\n\nVerification result:"
             )},
         ]
         size = measure_messages_bytes(messages) + guard_overhead
         if size > BUDGET_BYTES:
-            # 전체 폴백도 예산 초과 시 자동 승인 (비교 불가)
             print(f"[final_fact_checker] fallback-full budget exceeded ({size/1024:.1f}KB) — auto-approve")
             return {
                 "is_draft_approved": True,
-                "draft_feedback": f"[예산초과 자동승인] 전체 비교 불가 ({size/1024:.1f}KB)",
+                "draft_feedback": f"[Budget exceeded auto-approve] Full comparison not possible ({size/1024:.1f}KB)",
             }
         result = structured_call(messages, FactCheckResult, role="judge",
                                 temperature=0.0, stream=True)
@@ -811,7 +818,7 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
             "draft_feedback": result.feedback,
         }
 
-    # 섹션별 개별 검증
+    # Section-by-section verification
     all_approved = True
     feedback_parts: List[str] = []
 
@@ -819,20 +826,18 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
         _, orig_body = split_section_header_body(orig)
         _, pol_body = split_section_header_body(pol)
 
-        # 본문 변경 없음 — 검수 불필요
         if not orig_body.strip() or orig_body.strip() == pol_body.strip():
             continue
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": (
-                f"[ORIGINAL]\n{orig_body}\n\n[POLISHED]\n{pol_body}\n\n검증 결과:"
+                f"[ORIGINAL]\n{orig_body}\n\n[POLISHED]\n{pol_body}\n\nVerification result:"
             )},
         ]
         size = measure_messages_bytes(messages) + guard_overhead
 
         if size > BUDGET_BYTES:
-            # 섹션 쌍 예산 초과 — 건너뜀 (승인 처리)
             print(f"[final_fact_checker] section {i + 1} budget exceeded ({size/1024:.1f}KB) — skipped")
             continue
 
@@ -840,11 +845,11 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
                                 temperature=0.0, stream=True)
         if not result.is_draft_approved:
             all_approved = False
-            feedback_parts.append(f"섹션{i + 1}: {result.feedback}")
+            feedback_parts.append(f"Section {i + 1}: {result.feedback}")
         print(f"[final_fact_checker] section {i + 1}/{len(orig_sections)} "
               f"approved={result.is_draft_approved}")
 
-    feedback = "; ".join(feedback_parts) if feedback_parts else "전 섹션 검증 통과"
+    feedback = "; ".join(feedback_parts) if feedback_parts else "All sections verified"
     print(f"[final_fact_checker] overall approved={all_approved} retry={retry_count}")
     return {
         "is_draft_approved": all_approved,
@@ -853,11 +858,12 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
 
 
 def route_final_check(state: GraphState) -> str:
-    """polish 검증 분기."""
+    """Polish verification routing.
+    v1.3: Routes to prepare_translation instead of END on approval.
+    """
     if state.get("is_draft_approved"):
-        return "END"
+        return "prepare_translation"
     if state.get("polish_retry_count", 0) >= 2:
-        # Fail-Safe: 폴리시 우회, final_compiled를 최종 결과로 채택
         return "fallback_to_compiled"
     return "retry_polish"
 
@@ -867,6 +873,277 @@ def retry_polish_node(state: GraphState) -> Dict[str, Any]:
 
 
 def fallback_to_compiled_node(state: GraphState) -> Dict[str, Any]:
-    """폴리시 우회 — final_compiled 그대로 채택."""
-    print("[fallback_to_compiled] polish 검증 실패 — 조립본 그대로 채택")
+    """Polish bypass — adopt final_compiled as-is."""
+    print("[fallback_to_compiled] polish verification failed — adopting assembly output")
     return {"final_output": state["final_compiled"]}
+
+
+# ══════════════════════════════════════════════════════════════
+# Phase 5: Translation (English → Korean)
+# ══════════════════════════════════════════════════════════════
+
+def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
+    """Pure Python: save English output + extract proper nouns for translation."""
+    english = state["final_output"]
+    nouns = extract_proper_nouns(english)
+    print(f"[prepare_translation] English output saved ({len(english)} chars), "
+          f"extracted {len(nouns)} proper nouns")
+    if nouns:
+        print(f"  sample nouns: {nouns[:10]}")
+    return {
+        "english_output": english,
+        "proper_nouns": nouns,
+        "translation_retry_count": 0,
+    }
+
+
+def translate_node(state: GraphState) -> Dict[str, Any]:
+    """Translate English whitepaper to Korean with proper noun preservation.
+
+    Strategy:
+      1. Try full-document translation if within budget.
+      2. If budget exceeded, translate section by section.
+      3. Structural elements (doc header, audit log) translated via
+         deterministic string replacement (no LLM hallucination risk).
+    """
+    english = state["english_output"]
+    proper_nouns = state.get("proper_nouns", [])
+    retry = state.get("translation_retry_count", 0)
+    feedback = state.get("translation_feedback", "")
+
+    # Build proper noun reference
+    noun_ref = "\n".join(f"  - {n}" for n in proper_nouns[:100]) if proper_nouns else "(none)"
+
+    retry_hint = ""
+    if retry > 0 and feedback:
+        retry_hint = f"\n\n[PREVIOUS TRANSLATION REJECTED — fix these issues]\n{feedback}\n"
+
+    system_prompt = (
+        "You are a professional English-to-Korean translator specializing in "
+        "technical and business documents.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Preserve ALL proper nouns EXACTLY as they appear in English "
+        "(do NOT transliterate, translate, or modify them).\n"
+        "2. Preserve all dates (YYYY-MM-DD, YYYY-MM), numbers, percentages, "
+        "and units exactly as written.\n"
+        "3. Do NOT add any information not present in the English original.\n"
+        "4. Do NOT omit any information from the English original.\n"
+        "5. Maintain all markdown formatting: headers (##), lists (-), "
+        "blockquotes (>), bold (**), italics (_), warning blocks.\n"
+        "6. Produce natural, fluent Korean suitable for a formal whitepaper.\n"
+        "7. Translate section headers and descriptive text to Korean, "
+        "but keep proper nouns within them unchanged.\n\n"
+        f"[PROPER NOUNS — PRESERVE EXACTLY AS-IS]\n{noun_ref}"
+    )
+    guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
+
+    # --- Attempt 1: Full-document translation ---
+    full_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": (
+            f"Translate the following English whitepaper to Korean:{retry_hint}\n\n"
+            f"{english}\n\nKorean translation:"
+        )},
+    ]
+    full_size = measure_messages_bytes(full_messages) + guard_overhead
+
+    if full_size <= BUDGET_BYTES:
+        result = structured_call(
+            full_messages, PolishedDocument, role="writer",
+            temperature=0.1, stream=True,
+        )
+        print(f"[translate] full-document, retry={retry}, len={len(result.content)}")
+        return {"final_output": result.content}
+
+    # --- Attempt 2: Section-by-section translation ---
+    doc_header, sections, audit = split_compiled_by_section(english)
+    translated_parts: List[str] = []
+
+    for i, section in enumerate(sections):
+        sec_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": (
+                f"Translate this section to Korean:{retry_hint}\n\n"
+                f"{section}\n\nKorean translation:"
+            )},
+        ]
+        sec_size = measure_messages_bytes(sec_messages) + guard_overhead
+
+        if sec_size <= BUDGET_BYTES:
+            sec_result = structured_call(
+                sec_messages, PolishedDocument, role="writer",
+                temperature=0.1, stream=True,
+            )
+            translated_parts.append(sec_result.content)
+        else:
+            # Section too large — paragraph by paragraph
+            header, body = split_section_header_body(section)
+            paragraphs = body.split("\n\n")
+            translated_paras: List[str] = []
+
+            # Translate header separately
+            hdr_msgs = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": (
+                    f"Translate this markdown header to Korean (keep proper nouns):\n\n"
+                    f"{header}\n\nKorean:"
+                )},
+            ]
+            hdr_size = measure_messages_bytes(hdr_msgs) + guard_overhead
+            if hdr_size <= BUDGET_BYTES:
+                hdr_result = structured_call(hdr_msgs, PolishedDocument, role="writer", temperature=0.1)
+                kr_header = hdr_result.content
+            else:
+                # Deterministic fallback for header
+                kr_header = header.replace("Target period:", "대상 기간:")
+
+            for para in paragraphs:
+                if not para.strip():
+                    translated_paras.append(para)
+                    continue
+                para_msgs = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": (
+                        f"Translate to Korean:\n\n{para}\n\nKorean:"
+                    )},
+                ]
+                para_size = measure_messages_bytes(para_msgs) + guard_overhead
+                if para_size <= BUDGET_BYTES:
+                    para_result = structured_call(
+                        para_msgs, PolishedDocument, role="writer", temperature=0.1,
+                    )
+                    translated_paras.append(para_result.content)
+                else:
+                    translated_paras.append(para)  # Keep English if too large
+            translated_parts.append(kr_header + "\n\n".join(translated_paras))
+
+        print(f"[translate] section {i + 1}/{len(sections)} done")
+
+    # Deterministic structural translations (no LLM needed)
+    kr_header = doc_header.replace("# Comprehensive Whitepaper", "# 종합 백서")
+    kr_audit = ""
+    if audit:
+        kr_audit = (
+            audit
+            .replace("### Audit Log", "### 감사 로그")
+            .replace("Unverified section indices:", "검증 미완료 섹션 인덱스:")
+        )
+
+    final = kr_header + "\n".join(translated_parts) + kr_audit
+    print(f"[translate] section-by-section, retry={retry}, len={len(final)}")
+    return {"final_output": final}
+
+
+def translation_checker_node(state: GraphState) -> Dict[str, Any]:
+    """Verify translation quality: proper noun preservation + semantic fidelity.
+
+    Defense layers:
+      1. Pure Python: check proper noun presence in Korean text.
+      2. LLM spot-check: sample first section pair for semantic fidelity.
+    """
+    english = state["english_output"]
+    korean = state["final_output"]
+    proper_nouns = state.get("proper_nouns", [])
+    retry = state.get("translation_retry_count", 0)
+
+    # --- Layer 1: Pure Python proper noun check ---
+    missing = [n for n in proper_nouns if n not in korean]
+    missing_ratio = len(missing) / max(len(proper_nouns), 1)
+
+    if missing_ratio > 0.3:
+        msg = f"Too many proper nouns missing ({len(missing)}/{len(proper_nouns)}): {missing[:15]}"
+        print(f"[translation_checker] REJECTED (python): {msg}")
+        return {
+            "is_translation_approved": False,
+            "translation_feedback": msg,
+        }
+
+    # --- Layer 2: Structural integrity ---
+    _, en_sections, _ = split_compiled_by_section(english)
+    _, kr_sections, _ = split_compiled_by_section(korean)
+    if len(en_sections) > 0 and len(kr_sections) == 0:
+        msg = "Translation lost all section structure"
+        print(f"[translation_checker] REJECTED (structure): {msg}")
+        return {
+            "is_translation_approved": False,
+            "translation_feedback": msg,
+        }
+
+    # --- Layer 3: LLM spot-check on first section pair ---
+    if en_sections and kr_sections:
+        en_sample = en_sections[0][:2000]
+        kr_sample = kr_sections[0][:2000]
+
+        spot_system = (
+            "You are a translation quality auditor. Compare the English original "
+            "and Korean translation below. Check for:\n"
+            "1. Proper nouns, dates, or numbers that were altered or missing\n"
+            "2. Information added that is not in the English original\n"
+            "3. Information from the English original that was omitted\n"
+            "Report any issues found. Respond in English."
+        )
+        spot_messages = [
+            {"role": "system", "content": spot_system},
+            {"role": "user", "content": (
+                f"[ENGLISH ORIGINAL]\n{en_sample}\n\n"
+                f"[KOREAN TRANSLATION]\n{kr_sample}\n\n"
+                "Verification result:"
+            )},
+        ]
+        guard_overhead = estimate_guard_overhead(TranslationCheckResult.model_json_schema())
+        spot_size = measure_messages_bytes(spot_messages) + guard_overhead
+
+        if spot_size <= BUDGET_BYTES:
+            result = structured_call(
+                spot_messages, TranslationCheckResult, role="judge", temperature=0.0,
+            )
+            if not result.is_approved:
+                all_missing = list(set(missing + result.missing_terms))
+                msg = f"LLM spot-check failed: {result.feedback}. Missing: {all_missing[:10]}"
+                print(f"[translation_checker] REJECTED (LLM): {msg}")
+                return {
+                    "is_translation_approved": False,
+                    "translation_feedback": msg,
+                }
+            print(f"[translation_checker] LLM spot-check passed: {result.feedback[:60]}")
+        else:
+            print(f"[translation_checker] LLM spot-check skipped (budget exceeded)")
+
+    # All checks passed
+    if missing:
+        print(f"[translation_checker] minor missing nouns (accepted): {missing[:5]}")
+    print(f"[translation_checker] APPROVED retry={retry}")
+    return {
+        "is_translation_approved": True,
+        "translation_feedback": "Translation approved" + (
+            f" (minor missing: {missing})" if missing else ""
+        ),
+    }
+
+
+def route_translation(state: GraphState) -> str:
+    """Translation verification routing."""
+    if state.get("is_translation_approved"):
+        return "END"
+    if state.get("translation_retry_count", 0) >= 2:
+        return "fallback_english"
+    return "retry_translate"
+
+
+def retry_translate_node(state: GraphState) -> Dict[str, Any]:
+    """Increment retry counter for translation re-attempt."""
+    retry = state.get("translation_retry_count", 0) + 1
+    print(f"[retry_translate] retrying translation (attempt {retry})")
+    return {"translation_retry_count": retry}
+
+
+def fallback_english_node(state: GraphState) -> Dict[str, Any]:
+    """Translation verification failed — keep English version with warning header."""
+    english = state["english_output"]
+    warned = (
+        "> ⚠️ **Translation Notice** — English-to-Korean translation could not be verified "
+        "after multiple attempts. English original is preserved below.\n\n"
+        + english
+    )
+    print("[fallback_english] Translation verification failed — keeping English output")
+    return {"final_output": warned}
