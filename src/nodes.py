@@ -30,6 +30,7 @@ from .utils import (
     extract_years_from_content, extract_sections_for_year,
     count_expected_periods, validate_korean_structure,
 )
+from .logger import plog, psub
 from .context_guard import (
     BUDGET_BYTES, fits_budget, estimate_guard_overhead, available_data_budget,
     split_items_for_budget, trim_retry_context, cross_check_terms,
@@ -66,8 +67,8 @@ def load_docs_node(state: GraphState) -> Dict[str, Any]:
                 docs.append(json.loads(line))
             except json.JSONDecodeError as e:
                 failed += 1
-                print(f"  [load_docs] line {ln} skipped: {e}")
-    print(f"[load_docs] loaded={len(docs)} failed={failed}")
+                psub("load_docs", f"line {ln} skipped: {e}")
+    plog("load_docs", f"loaded={len(docs)} failed={failed}")
     return {"raw_docs": docs}
 
 
@@ -115,23 +116,23 @@ def strict_extractor_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         allowed = max(len(doc_bytes) - excess, 256)
         doc_text = doc_bytes[:allowed].decode("utf-8", errors="ignore") + " [TRUNCATED]"
         messages = _build_messages(doc_text)
-        print(f"  [extractor] doc {idx} truncated: {size/1024:.1f}KB → target fit")
+        psub("extractor", f"doc {idx} truncated: {size/1024:.1f}KB → target fit")
 
     try:
         ev = structured_call(messages, ExtractedEvent, role="extractor", temperature=0.0)
         if not is_valid_date(ev.date):
-            print(f"  [extractor] doc {idx} invalid date '{ev.date}' — dropped")
+            psub("extractor", f"doc {idx} invalid date '{ev.date}' — dropped")
             return {"extracted_events": []}
         return {"extracted_events": [ev.model_dump()]}
     except Exception as e:
-        print(f"  [extractor] doc {idx} failed after retries: {e}")
+        psub("extractor", f"doc {idx} failed after retries: {e}")
         return {"extracted_events": []}
 
 
 def chrono_sorter_node(state: GraphState) -> Dict[str, Any]:
     """Pure Python sort + monthly grouping."""
     grouped = chrono_sort_and_group(state["extracted_events"])
-    print(f"[chrono_sorter] events={len(state['extracted_events'])} months={list(grouped.keys())}")
+    plog("chrono_sorter", f"events={len(state['extracted_events'])} months={list(grouped.keys())}")
     return {"grouped_chunks": grouped}
 
 
@@ -174,7 +175,7 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if size <= BUDGET_BYTES:
         result = structured_call(messages, PeriodSummary, role="default", temperature=0.2)
-        print(f"[period_summarizer] {period}: {result.summary[:60]}...")
+        plog("period_summarizer", f"{period}: {result.summary[:60]}...")
         return {"period_summaries": {period: result.summary}}
 
     # Budget exceeded — batch split
@@ -184,7 +185,7 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         extra_fixed=user_template.format(period=period, events_text=""),
     )
     batches = split_items_for_budget(events, format_events_for_prompt, data_budget)
-    print(f"[period_summarizer] {period}: budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
+    plog("period_summarizer", f"{period}: budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
 
     sub_summaries: List[str] = []
     for batch in batches:
@@ -208,7 +209,7 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         )},
     ]
     merged = structured_call(merge_messages, PeriodSummary, role="default", temperature=0.2)
-    print(f"[period_summarizer] {period}: merged summary: {merged.summary[:60]}...")
+    plog("period_summarizer", f"{period}: merged summary: {merged.summary[:60]}...")
     return {"period_summaries": {period: merged.summary}}
 
 
@@ -244,13 +245,13 @@ def theme_analyzer_node(state: GraphState) -> Dict[str, Any]:
 
     while size > BUDGET_BYTES and len(active_periods) > 1:
         removed = active_periods.pop(0)
-        print(f"[theme_analyzer] budget exceeded — removing oldest period: {removed}")
+        plog("theme_analyzer", f"budget exceeded — removing oldest period: {removed}")
         joined = _make_joined(active_periods)
         messages = _build_messages(joined)
         size = measure_messages_bytes(messages) + guard_overhead
 
     result = structured_call(messages, GlobalTheme, role="default", temperature=0.3)
-    print(f"[theme_analyzer] theme: {result.theme[:80]}...")
+    plog("theme_analyzer", f"theme: {result.theme[:80]}...")
     return {"global_theme": result.theme}
 
 
@@ -302,11 +303,11 @@ def draft_planner_node(state: GraphState) -> Dict[str, Any]:
         )
         messages = _build_messages(truncated_joined, retry_hint)
         new_size = measure_messages_bytes(messages) + guard_overhead
-        print(f"[draft_planner] budget exceeded ({size/1024:.1f}KB → {new_size/1024:.1f}KB) — summaries truncated")
+        plog("draft_planner", f"budget exceeded ({size/1024:.1f}KB → {new_size/1024:.1f}KB) — summaries truncated")
 
     result = structured_call(messages, Outline, role="default", temperature=0.3)
     items = [it.model_dump() for it in result.items]
-    print(f"[draft_planner] outline items={len(items)}")
+    plog("draft_planner", f"outline items={len(items)}")
     return {"outline": items}
 
 
@@ -324,7 +325,7 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
     invalid_periods = validate_outline_periods(outline, grouped)
     if invalid_periods:
         msg = f"Non-existent target_period used: {invalid_periods}"
-        print(f"[planner_critique] REJECTED (python): {msg}")
+        plog("planner_critique", f"REJECTED (python): {msg}")
         return {
             "is_outline_approved": False,
             "outline_feedback": msg,
@@ -335,7 +336,7 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
     periods = [it["target_period"] for it in outline]
     if periods != sorted(periods):
         msg = f"Chronological order violation. Current order: {periods}"
-        print(f"[planner_critique] REJECTED (python): {msg}")
+        plog("planner_critique", f"REJECTED (python): {msg}")
         return {
             "is_outline_approved": False,
             "outline_feedback": msg,
@@ -374,15 +375,15 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
         ]
         outline_text = _make_outline_text(truncated)
         messages = _build_messages(outline_text)
-        print(f"[planner_critique] budget exceeded ({size/1024:.1f}KB) — outline intent truncated")
+        plog("planner_critique", f"budget exceeded ({size/1024:.1f}KB) — outline intent truncated")
 
     result = structured_call(messages, OutlineCritique, role="judge", temperature=0.0)
     retry = state.get("outline_retry_count", 0) + (0 if result.is_outline_approved else 1)
-    print(f"[planner_critique] approved={result.is_outline_approved} retry={retry}")
+    plog("planner_critique", f"approved={result.is_outline_approved} retry={retry}")
 
     # Fail-Safe: force pass after 3 retries
     if not result.is_outline_approved and retry >= 3:
-        print("[planner_critique] FAIL-SAFE: forced pass (3+ retries)")
+        plog("planner_critique", "FAIL-SAFE: forced pass (3+ retries)")
         return {
             "is_outline_approved": True,
             "outline_feedback": f"[FORCED PASS] {result.feedback}",
@@ -469,7 +470,7 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
 
     if size <= BUDGET_BYTES:
         result = structured_call(messages, SectionDraft, role="writer", temperature=0.3)
-        print(f"[section_writer] idx={idx} period={period} retry={retry} len={len(result.content)}")
+        plog("section_writer", f"idx={idx} period={period} retry={retry} len={len(result.content)}")
         return {"current_draft": result.content}
 
     # Budget exceeded — batch split
@@ -479,7 +480,7 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         extra_fixed=user_prefix + user_suffix,
     )
     batches = split_items_for_budget(events, format_events_for_prompt, data_budget)
-    print(f"[section_writer] idx={idx} budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
+    plog("section_writer", f"idx={idx} budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
 
     partial_system = (
         "You are a whitepaper writer. Write body text covering the key content of the "
@@ -524,10 +525,10 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         merged = structured_call(merge_msgs, SectionDraft, role="writer", temperature=0.3)
         content = merged.content
     else:
-        print(f"[section_writer] idx={idx} merge also exceeded budget — concatenating")
+        plog("section_writer", f"idx={idx} merge also exceeded budget — concatenating")
         content = "\n\n".join(partial_drafts)
 
-    print(f"[section_writer] idx={idx} period={period} retry={retry} len={len(content)}")
+    plog("section_writer", f"idx={idx} period={period} retry={retry} len={len(content)}")
     return {"current_draft": content}
 
 
@@ -569,8 +570,7 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
 
     if size <= BUDGET_BYTES:
         result = structured_call(messages, FactCheckResult, role="judge", temperature=0.0)
-        print(f"[fact_checker] idx={idx} approved={result.is_draft_approved} "
-              f"halluc={result.hallucinated_terms[:3]}")
+        plog("fact_checker", f"idx={idx} approved={result.is_draft_approved} halluc={result.hallucinated_terms[:3]}")
         return {
             "is_draft_approved": result.is_draft_approved,
             "draft_feedback": result.feedback,
@@ -616,8 +616,7 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
     truly_hallucinated = cross_check_terms(all_candidates, events)
     is_approved = len(truly_hallucinated) == 0
     feedback = "; ".join(all_feedback) if all_feedback else "Batch verification passed"
-    print(f"[fact_checker] idx={idx} batched: {len(batches)} batches, "
-          f"candidates={len(all_candidates)}, truly_halluc={len(truly_hallucinated)}")
+    plog("fact_checker", f"idx={idx} batched: {len(batches)} batches, candidates={len(all_candidates)}, truly_halluc={len(truly_hallucinated)}")
 
     return {
         "is_draft_approved": is_approved,
@@ -652,7 +651,7 @@ def save_section_node(state: GraphState) -> Dict[str, Any]:
     """Save approved section + advance index + reset scope."""
     idx = state["current_section_index"]
     draft = state["current_draft"]
-    print(f"[save_section] idx={idx} APPROVED")
+    plog("save_section", f"idx={idx} APPROVED")
     return {
         "completed_sections": {idx: draft},
         "current_section_index": idx + 1,
@@ -671,7 +670,7 @@ def save_section_with_warning_node(state: GraphState) -> Dict[str, Any]:
         f"> Last rejection reason: {feedback}\n\n"
         f"{draft}"
     )
-    print(f"[save_section_with_warning] idx={idx} FORCE-PASS")
+    plog("save_section_with_warning", f"idx={idx} FORCE-PASS")
     return {
         "completed_sections": {idx: warned},
         "unverified_sections": [idx],
@@ -697,7 +696,7 @@ def compiler_node(state: GraphState) -> Dict[str, Any]:
     completed = state.get("completed_sections", {})
     unverified = state.get("unverified_sections", [])
     compiled = compile_sections(outline, completed, unverified)
-    print(f"[compiler] sections={len(completed)} unverified={unverified} len={len(compiled)}")
+    plog("compiler", f"sections={len(completed)} unverified={unverified} len={len(compiled)}")
     return {"final_compiled": compiled, "polish_retry_count": 0}
 
 
@@ -711,7 +710,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
     doc_header, sections, audit = split_compiled_by_section(compiled)
 
     if not sections:
-        print("[polish] no sections found — skipping")
+        plog("polish", "no sections found — skipping")
         return {"final_output": compiled}
 
     system_prompt = (
@@ -743,8 +742,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
                 temperature=0.1, stream=True,
             )
             polished_sections.append(header + result.content)
-            print(f"[polish] section {i + 1}/{len(sections)} retry={retry_count} "
-                  f"len={len(result.content)}")
+            plog("polish", f"section {i + 1}/{len(sections)} retry={retry_count} len={len(result.content)}")
         else:
             # Section exceeds budget — paragraph-level split
             paragraphs = body.split("\n\n")
@@ -768,11 +766,10 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
                     polished_paragraphs.append(para)
             polished_body = "\n\n".join(polished_paragraphs)
             polished_sections.append(header + polished_body)
-            print(f"[polish] section {i + 1}/{len(sections)} retry={retry_count} "
-                  f"paragraphs={len(paragraphs)} (budget exceeded, split)")
+            plog("polish", f"section {i + 1}/{len(sections)} retry={retry_count} paragraphs={len(paragraphs)} (budget exceeded, split)")
 
     final = doc_header + "".join(polished_sections) + audit
-    print(f"[polish] done: sections={len(sections)} total_len={len(final)}")
+    plog("polish", f"done: sections={len(sections)} total_len={len(final)}")
     return {"final_output": final}
 
 
@@ -806,15 +803,14 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
         ]
         size = measure_messages_bytes(messages) + guard_overhead
         if size > BUDGET_BYTES:
-            print(f"[final_fact_checker] fallback-full budget exceeded ({size/1024:.1f}KB) — auto-approve")
+            plog("final_fact_checker", f"fallback-full budget exceeded ({size/1024:.1f}KB) — auto-approve")
             return {
                 "is_draft_approved": True,
                 "draft_feedback": f"[Budget exceeded auto-approve] Full comparison not possible ({size/1024:.1f}KB)",
             }
         result = structured_call(messages, FactCheckResult, role="judge",
                                 temperature=0.0, stream=True)
-        print(f"[final_fact_checker] fallback-full approved={result.is_draft_approved} "
-              f"retry={retry_count}")
+        plog("final_fact_checker", f"fallback-full approved={result.is_draft_approved} retry={retry_count}")
         return {
             "is_draft_approved": result.is_draft_approved,
             "draft_feedback": result.feedback,
@@ -840,7 +836,7 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
         size = measure_messages_bytes(messages) + guard_overhead
 
         if size > BUDGET_BYTES:
-            print(f"[final_fact_checker] section {i + 1} budget exceeded ({size/1024:.1f}KB) — skipped")
+            plog("final_fact_checker", f"section {i + 1} budget exceeded ({size/1024:.1f}KB) — skipped")
             continue
 
         result = structured_call(messages, FactCheckResult, role="judge",
@@ -848,11 +844,10 @@ def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
         if not result.is_draft_approved:
             all_approved = False
             feedback_parts.append(f"Section {i + 1}: {result.feedback}")
-        print(f"[final_fact_checker] section {i + 1}/{len(orig_sections)} "
-              f"approved={result.is_draft_approved}")
+        plog("final_fact_checker", f"section {i + 1}/{len(orig_sections)} approved={result.is_draft_approved}")
 
     feedback = "; ".join(feedback_parts) if feedback_parts else "All sections verified"
-    print(f"[final_fact_checker] overall approved={all_approved} retry={retry_count}")
+    plog("final_fact_checker", f"overall approved={all_approved} retry={retry_count}")
     return {
         "is_draft_approved": all_approved,
         "draft_feedback": feedback,
@@ -876,7 +871,7 @@ def retry_polish_node(state: GraphState) -> Dict[str, Any]:
 
 def fallback_to_compiled_node(state: GraphState) -> Dict[str, Any]:
     """Polish bypass — adopt final_compiled as-is."""
-    print("[fallback_to_compiled] polish verification failed — adopting assembly output")
+    plog("fallback_to_compiled", "polish verification failed — adopting assembly output")
     return {"final_output": state["final_compiled"]}
 
 
@@ -889,10 +884,9 @@ def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
     """Pure Python: save English output + extract proper nouns for rendering."""
     english = state["final_output"]
     nouns = extract_proper_nouns(english)
-    print(f"[prepare_translation] English output saved ({len(english)} chars), "
-          f"extracted {len(nouns)} proper nouns")
+    plog("prepare_translation", f"English output saved ({len(english)} chars), extracted {len(nouns)} proper nouns")
     if nouns:
-        print(f"  sample nouns: {nouns[:10]}")
+        psub("prepare_translation", f"sample nouns: {nouns[:10]}")
     return {
         "english_output": english,
         "proper_nouns": nouns,
@@ -1031,7 +1025,7 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
                 temperature=0.2, stream=True,
             )
             rendered_parts.append(result.content)
-            print(f"[translate] year={year} full-render, len={len(result.content)}")
+            plog("translate", f"year={year} full-render, len={len(result.content)}")
         else:
             # --- Attempt 2: Section-by-section within year ---
             year_rendered: List[str] = [f"## {year}년\n"]
@@ -1057,10 +1051,10 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
                 else:
                     # Paragraph-level fallback: keep original section
                     year_rendered.append(sec)
-                print(f"[translate] year={year} section {si+1}/{len(year_sections)} done")
+                plog("translate", f"year={year} section {si+1}/{len(year_sections)} done")
 
             rendered_parts.append("\n\n".join(year_rendered))
-            print(f"[translate] year={year} section-by-section render")
+            plog("translate", f"year={year} section-by-section render")
 
         # Accumulate previous_context for narrative continuity across years
         if rendered_parts:
@@ -1080,7 +1074,7 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
     if kr_audit:
         final += "\n" + kr_audit
 
-    print(f"[translate] done: years={years} retry={retry} len={len(final)}")
+    plog("translate", f"done: years={years} retry={retry} len={len(final)}")
     return {"final_output": final}
 
 
@@ -1103,7 +1097,7 @@ def translation_checker_node(state: GraphState) -> Dict[str, Any]:
 
     if missing_ratio > 0.3:
         msg = f"Too many proper nouns missing ({len(missing)}/{len(proper_nouns)}): {missing[:15]}"
-        print(f"[translation_checker] REJECTED (proper nouns): {msg}")
+        plog("translation_checker", f"REJECTED (proper nouns): {msg}")
         return {
             "is_translation_approved": False,
             "translation_feedback": msg,
@@ -1114,12 +1108,12 @@ def translation_checker_node(state: GraphState) -> Dict[str, Any]:
     struct_ok, struct_msg = validate_korean_structure(korean, expected_count)
 
     if not struct_ok:
-        print(f"[translation_checker] REJECTED (structure): {struct_msg}")
+        plog("translation_checker", f"REJECTED (structure): {struct_msg}")
         return {
             "is_translation_approved": False,
             "translation_feedback": struct_msg,
         }
-    print(f"[translation_checker] structure check: {struct_msg}")
+    plog("translation_checker", f"structure check: {struct_msg}")
 
     # --- Layer 3: LLM spot-check on first ~2000 chars ---
     en_sample = english[:2000]
@@ -1153,19 +1147,19 @@ def translation_checker_node(state: GraphState) -> Dict[str, Any]:
         if not result.is_approved:
             all_missing = list(set(missing + result.missing_terms))
             msg = f"LLM spot-check failed: {result.feedback}. Missing: {all_missing[:10]}"
-            print(f"[translation_checker] REJECTED (LLM): {msg}")
+            plog("translation_checker", f"REJECTED (LLM): {msg}")
             return {
                 "is_translation_approved": False,
                 "translation_feedback": msg,
             }
-        print(f"[translation_checker] LLM spot-check passed: {result.feedback[:60]}")
+        plog("translation_checker", f"LLM spot-check passed: {result.feedback[:60]}")
     else:
-        print("[translation_checker] LLM spot-check skipped (budget exceeded)")
+        psub("translation_checker", "LLM spot-check skipped (budget exceeded)")
 
     # All checks passed
     if missing:
-        print(f"[translation_checker] minor missing nouns (accepted): {missing[:5]}")
-    print(f"[translation_checker] APPROVED retry={retry}")
+        plog("translation_checker", f"minor missing nouns (accepted): {missing[:5]}")
+    plog("translation_checker", f"APPROVED retry={retry}")
     return {
         "is_translation_approved": True,
         "translation_feedback": "Rendering approved" + (
@@ -1186,7 +1180,7 @@ def route_translation(state: GraphState) -> str:
 def retry_translate_node(state: GraphState) -> Dict[str, Any]:
     """Increment retry counter for translation re-attempt."""
     retry = state.get("translation_retry_count", 0) + 1
-    print(f"[retry_translate] retrying rendering (attempt {retry})")
+    plog("retry_translate", f"retrying rendering (attempt {retry})")
     return {"translation_retry_count": retry}
 
 
@@ -1198,5 +1192,5 @@ def fallback_english_node(state: GraphState) -> Dict[str, Any]:
         "after multiple attempts. English original is preserved below.\n\n"
         + english
     )
-    print("[fallback_english] Rendering verification failed — keeping English output")
+    plog("fallback_english", "Rendering verification failed — keeping English output")
     return {"final_output": warned}

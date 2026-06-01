@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from .context_guard import (
     BUDGET_BYTES, measure_messages_bytes, ContextBudgetExceeded,
 )
+from .logger import psub, count_llm, get_llm_count
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -128,7 +129,7 @@ class RateLimiter:
                 wait = self._timestamps[0] + self._window - now
             # Lock 해제 후 sleep (다른 스레드 차단 방지)
             if wait > 0:
-                print(f"  [rate_limiter] {self._max_rpm}/min 한도 도달 — {wait:.1f}s 대기")
+                psub("rate_limiter", f"{self._max_rpm}/min 한도 도달 — {wait:.1f}s 대기 (LLM #{get_llm_count()})")
                 time.sleep(wait + 0.1)
 
     def __exit__(self, *exc):
@@ -323,7 +324,7 @@ def structured_call(
                         break
                 if payload_bytes > BUDGET_BYTES:
                     raise ContextBudgetExceeded(payload_bytes, BUDGET_BYTES)
-                print(f"  [structured_call] retry 컨텍스트 트리밍 후 {payload_bytes/1024:.1f}KB")
+                psub("structured_call", f"retry 컨텍스트 트리밍 후 {payload_bytes/1024:.1f}KB")
 
             with _rate_limiter:
                 if stream:
@@ -339,6 +340,7 @@ def structured_call(
                         if chunk.choices and chunk.choices[0].delta.content:
                             _chunks.append(chunk.choices[0].delta.content)
                     last_raw = "".join(_chunks)
+                    count_llm()
                 else:
                     response = _client.chat.completions.create(
                         model=model,
@@ -346,6 +348,7 @@ def structured_call(
                         temperature=temperature,
                     )
                     last_raw = response.choices[0].message.content or ""
+                    count_llm()
 
             # extract_json → Pydantic 검증
             parsed_dict = extract_json(last_raw, expect="object")
@@ -353,10 +356,7 @@ def structured_call(
 
         except Exception as e:
             last_err = e
-            print(
-                f"  [structured_call][retry {attempt + 1}/{max_retries}] "
-                f"{type(e).__name__}: {e}"
-            )
+            psub("structured_call", f"retry {attempt + 1}/{max_retries} — {type(e).__name__}: {e}")
             # 재시도: 직전 응답을 보여주고 JSON-only 재요청
             work_messages.append({"role": "assistant", "content": last_raw})
             work_messages.append(
