@@ -26,13 +26,15 @@ except ImportError:
 from src.graph import build_graph
 from src.nodes import LOCAL_DATA_PATH
 from src.logger import reset_stats, summary
-from src.llm import reset_504_state
+from src.llm import reset_504_state, set_default_reasoning
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Deep Doc Pipeline — Whitepaper Generator (EN→KR)")
     p.add_argument("--output", default="./output.md", help="최종 한글 백서 저장 경로")
     p.add_argument("--output-en", default=None, help="영문 원본 저장 경로 (기본: output 경로에 _en 붙임)")
+    p.add_argument("--reasoning", choices=["high", "medium"], default="high",
+                   help="LLM 추론 강도 (high: 기본, medium: 빠른 응답/낮은 품질)")
     return p.parse_args()
 
 
@@ -46,14 +48,16 @@ def main():
         sys.exit(1)
 
     print("=" * 70)
-    print("Deep Doc Pipeline v1.3.1 — Whitepaper Generator (EN→KR)")
+    print("Deep Doc Pipeline v1.4 — Whitepaper Generator (EN→KR)")
     print(f"모델: {os.getenv('OPENAI_MODEL', 'gpt-oss:20b')} @ "
           f"{os.getenv('OPENAI_BASE_URL', 'http://localhost:11434/v1')}")
+    print(f"추론: {args.reasoning} | 504 2회 초과 시 medium 자동 전환")
     print("=" * 70)
 
-    # 타이머 + 카운터 + 504 상태 초기화
+    # 타이머 + 카운터 + 504 상태 + 추론 강도 초기화
     reset_stats()
     reset_504_state()
+    set_default_reasoning(args.reasoning)
 
     graph = build_graph()
 

@@ -251,7 +251,7 @@ _504_MIN_TOKENS: int = 1_024       # never go below 1,024 tokens
 _504_token_offset: int = 0
 _504_budget_offset: int = 0
 _504_count: int = 0           # cumulative 504s in current node scope
-_504_REASONING_THRESHOLD = 5  # downgrade reasoning_effort after this many 504s
+_504_REASONING_THRESHOLD = 2  # downgrade reasoning_effort after 2 504s
 
 
 def reset_504_state() -> None:
@@ -289,15 +289,30 @@ def effective_max_tokens(base: int = MAX_COMPLETION_TOKENS) -> int:
     return max(base - _504_token_offset, _504_MIN_TOKENS)
 
 
-def effective_reasoning(base: str = "high") -> str:
-    """Downgrade reasoning_effort after 5+ consecutive 504s.
+# Global default reasoning — set by main.py via set_default_reasoning()
+_default_reasoning: str = "high"
 
-    high → medium reduces server-side processing time per request,
-    which is the primary cause of 504 Gateway Timeout.
+
+def set_default_reasoning(level: str) -> None:
+    """Set pipeline-wide default reasoning_effort. Called from main.py."""
+    global _default_reasoning
+    _default_reasoning = level
+
+
+def get_default_reasoning() -> str:
+    """Current pipeline default reasoning_effort."""
+    return _default_reasoning
+
+
+def effective_reasoning(base: str = "") -> str:
+    """Resolve reasoning_effort: 504 downgrade > explicit base > pipeline default.
+
+    After 2+ consecutive 504s within a node, force "medium" regardless.
     """
+    resolved = base if base else _default_reasoning
     if _504_count >= _504_REASONING_THRESHOLD:
         return "medium"
-    return base
+    return resolved
 
 
 class Timeout504Error(Exception):
@@ -316,7 +331,7 @@ def structured_call(
     temperature: float = 0.0,
     max_retries: int = 3,
     stream: bool = False,
-    reasoning_effort: str = "high",
+    reasoning_effort: str = "",  # empty = use pipeline default (set_default_reasoning)
     max_tokens: int = MAX_COMPLETION_TOKENS,
 ) -> T:
     """GPT-OSS compatible Pydantic-enforced LLM call with 504 adaptive reduction.
