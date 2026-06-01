@@ -20,45 +20,43 @@ BUDGET_BYTES: int = int(os.getenv("LLM_CONTEXT_BUDGET_KB", "95")) * 1024
 
 
 class ContextBudgetExceeded(Exception):
-    """structured_call 내 예산 초과 시 발생 (모든 트리밍 시도 후에도 초과)."""
+    """Raised when context budget is exceeded after all trimming attempts."""
     def __init__(self, actual: int, budget: int):
         self.actual = actual
         self.budget = budget
         super().__init__(
-            f"컨텍스트 예산 초과: {actual:,}B ({actual/1024:.1f}KB) > "
+            f"Context budget exceeded: {actual:,}B ({actual/1024:.1f}KB) > "
             f"{budget:,}B ({budget/1024:.1f}KB)"
         )
 
 
-# ─── 측정 ────────────────────────────────────────────────────
+# ─── Measurement ────────────────────────────────────────────
 
 def measure_messages_bytes(messages: list) -> int:
-    """messages 리스트의 JSON 직렬화 UTF-8 바이트 수."""
+    """UTF-8 byte size of serialized messages list."""
     return len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
 
 
 def measure_text_bytes(text: str) -> int:
-    """단일 텍스트의 UTF-8 바이트 수."""
+    """UTF-8 byte size of a single text string."""
     return len(text.encode("utf-8"))
 
 
 def fits_budget(messages: list, budget: int = 0) -> Tuple[bool, int]:
-    """예산 내 여부와 실측 바이트 반환. budget=0이면 BUDGET_BYTES 사용."""
+    """Check if messages fit budget. Returns (fits, actual_bytes)."""
     if budget <= 0:
         budget = BUDGET_BYTES
     size = measure_messages_bytes(messages)
     return size <= budget, size
 
 
-# ─── 예산 계산 ───────────────────────────────────────────────
+# ─── Budget calculation ────────────────────────────────────
 
 def estimate_guard_overhead(schema: dict) -> int:
-    """structured_call이 system 프롬프트에 부가하는 JSON guard의 바이트 수 추정.
-    노드에서 messages 구성 후, structured_call 호출 전 총 예산을 추정할 때 사용.
-    """
+    """Estimate byte overhead of JSON guard appended by structured_call."""
     schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
-    guard_prefix_bytes = 350  # 고정 가드 텍스트 (출력 규약 설명)
-    return guard_prefix_bytes + len(schema_str.encode("utf-8")) + 128  # 마진
+    guard_prefix_bytes = 350  # fixed guard text
+    return guard_prefix_bytes + len(schema_str.encode("utf-8")) + 128  # margin
 
 
 def available_data_budget(
@@ -67,14 +65,7 @@ def available_data_budget(
     extra_fixed: str = "",
     margin: float = 0.85,
 ) -> int:
-    """시스템 프롬프트·스키마·가드를 제외한 데이터 가용 예산(bytes).
-
-    Args:
-        system_prompt: 노드의 system 메시지 텍스트
-        schema: response_model.model_json_schema()
-        extra_fixed: 반드시 포함되는 고정 텍스트 (retry extras 등)
-        margin: 안전 마진 (기본 85% — JSON wrapper/retry 여유)
-    """
+    """Available data budget (bytes) after subtracting system prompt, schema, and guard overhead."""
     overhead = (
         measure_text_bytes(system_prompt)
         + estimate_guard_overhead(schema)
@@ -84,18 +75,14 @@ def available_data_budget(
     return max(int(BUDGET_BYTES * margin) - overhead, 2048)
 
 
-# ─── 데이터 분할 ─────────────────────────────────────────────
+# ─── Data splitting ─────────────────────────────────────────
 
 def split_items_for_budget(
     items: List[Any],
     format_fn: Callable[[List[Any]], str],
     budget_bytes: int,
 ) -> List[List[Any]]:
-    """items를 format_fn 적용 시 budget_bytes 내에 맞도록 배치로 분할.
-
-    format_fn(batch) → str 변환 후 바이트 측정.
-    단일 아이템이 budget을 초과하면 해당 아이템만으로 배치 구성 (경고 출력).
-    """
+    """Split items into batches that fit within budget_bytes when formatted."""
     if not items:
         return []
 
@@ -126,7 +113,7 @@ def split_items_for_budget(
     return batches
 
 
-# ─── Retry 컨텍스트 축소 ─────────────────────────────────────
+# ─── Retry context trimming ─────────────────────────────────
 
 def trim_retry_context(
     previous_draft: str,
@@ -134,13 +121,7 @@ def trim_retry_context(
     hallucinated_tokens: List[str],
     budget_bytes: int = 20 * 1024,
 ) -> Tuple[str, str, List[str]]:
-    """retry 컨텍스트를 budget_bytes 내로 축소.
-
-    축소 우선순위 (덜 중요한 것부터):
-      1. previous_draft — 앞뒤 300자만 유지
-      2. feedback — 500자 제한
-      3. hallucinated_tokens — 최근 20개만
-    """
+    """Trim retry context to fit within budget_bytes."""
     total = (
         measure_text_bytes(previous_draft)
         + measure_text_bytes(feedback)
@@ -158,7 +139,7 @@ def trim_retry_context(
 
     # 2순위: feedback 축소
     if len(feedback) > 500:
-        feedback = feedback[:500] + "...[축소됨]"
+        feedback = feedback[:500] + "...[trimmed]"
 
     # 3순위: hallucinated_tokens 축소
     if len(hallucinated_tokens) > 20:
@@ -167,18 +148,13 @@ def trim_retry_context(
     return previous_draft, feedback, hallucinated_tokens
 
 
-# ─── 팩트체커 교차 검증 ──────────────────────────────────────
+# ─── Fact-checker cross-validation ──────────────────────────
 
 def cross_check_terms(
     candidates: List[str],
     events: List[Dict],
 ) -> List[str]:
-    """후보 환각 토큰이 전체 이벤트 원본에 존재하는지 Python 교차 확인.
-
-    배치 분할 팩트체크 후, 한 배치에서 '확인 불가'로 나온 토큰이
-    다른 배치의 이벤트에 실제 존재하는지 문자열 매칭으로 최종 판정.
-    존재하지 않는 후보만 반환 (진짜 환각).
-    """
+    """Cross-check candidate hallucinated tokens against all events. Returns truly absent tokens."""
     if not candidates or not events:
         return candidates
 

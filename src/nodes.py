@@ -1,11 +1,5 @@
 """
 LangGraph node functions. One Node = One Task principle strictly enforced.
-
-v1.3 changes:
-  - All LLM prompts forced to English output with proper noun preservation.
-  - Whitepaper-only (status_report mode and route_by_target removed).
-  - Translation stage added: prepare_translation → translate → translation_checker.
-  - route_final_check now routes to prepare_translation instead of END.
 """
 from __future__ import annotations
 import json
@@ -32,9 +26,9 @@ from .utils import (
 )
 from .logger import plog, psub
 from .context_guard import (
-    BUDGET_BYTES, fits_budget, estimate_guard_overhead, available_data_budget,
+    BUDGET_BYTES, estimate_guard_overhead, available_data_budget,
     split_items_for_budget, trim_retry_context, cross_check_terms,
-    measure_text_bytes, measure_messages_bytes,
+    measure_messages_bytes,
 )
 
 

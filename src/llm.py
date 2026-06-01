@@ -1,14 +1,10 @@
 """
-순수 OpenAI SDK 클라이언트 (LangChain 래퍼 금지).
-GPT-OSS 등 OpenAI 호환 엔드포인트 지원.
+OpenAI SDK LLM client.
 
-인증: HTTP 헤더 기반 (DEFAULT_HEADERS). API Key 환경변수 미사용.
-호출 제한: 슬라이딩 윈도우 Rate Limiter + 동시 요청 Semaphore.
-
-JSON 강제 전략 (response_format 미사용 — GPT-OSS 미지원):
-  1) 프롬프트 가드: Pydantic JSON Schema + 출력 규약 자동 첨부
-  2) extract_json(): 3단 폴백 파서 (raw → 코드펜스 → 균형 스캔)
-  3) 재시도: 직전 응답을 assistant 메시지로 넘겨 "JSON만 다시 출력" 재요청
+JSON output strategy (no response_format — GPT-OSS compatible):
+  1) Prompt guard: Pydantic JSON Schema injected into system prompt
+  2) extract_json(): 3-stage fallback parser (raw → code fence → brace scan)
+  3) Retry: feed previous response back as assistant message for JSON-only retry
 """
 from __future__ import annotations
 
@@ -31,34 +27,19 @@ from .logger import psub, count_llm, get_llm_count
 T = TypeVar("T", bound=BaseModel)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 접속 설정 — HARDCODE placeholder 패턴
+# Connection — env vars or hardcode below
 # ──────────────────────────────────────────────────────────────────────────────
-# 환경변수(OPENAI_BASE_URL / OPENAI_MODEL) 가 설정되어 있으면 그 값이 우선.
-# 아래 None / 빈 문자열을 실제 값으로 바꾸면 하드코딩 완료.
-# 인증은 DEFAULT_HEADERS 의 토큰 헤더로 처리 (API Key 환경변수 미사용).
-
-# 예) OPENAI_BASE_URL = "https://your-internal-gateway.example.com/v1"
-# 예) OPENAI_BASE_URL = "http://localhost:8000/v1"
-OPENAI_BASE_URL: Optional[str] = os.getenv("OPENAI_BASE_URL") or None  # <-- HARDCODE
-
-# 예) OPENAI_MODEL = "gpt-oss-20b"  /  "gpt-oss-120b"  /  "내부-모델-id"
-# 본 파이프라인은 GPT-OSS(오픈소스/로컬) 모델 사용을 전제로 함.
-# → response_format 인자 미지원. JSON 출력은 프롬프트 + 파서로 강제.
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-oss-20b")  # <-- HARDCODE
+OPENAI_BASE_URL: Optional[str] = os.getenv("OPENAI_BASE_URL") or None
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-oss-20b")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 인증 헤더 (OpenAI default_headers 로 주입됨)
+# Auth headers (injected via OpenAI default_headers)
 # ──────────────────────────────────────────────────────────────────────────────
-# [HARDCODE HERE] 아래 dict 의 주석을 해제하고 실제 헤더 값으로 교체하세요.
-# 환경변수 OPENAI_EXTRA_HEADERS (JSON 문자열) 를 추가로 병합할 수 있습니다.
+# Uncomment and fill, or use OPENAI_EXTRA_HEADERS env var (JSON string).
 DEFAULT_HEADERS: Dict[str, str] = {
-    # "Authorization":   "Bearer <YOUR_TOKEN_HERE>",          # 인증 토큰
-    # "X-API-Key":       "<YOUR_API_KEY_HERE>",               # 게이트웨이 API Key
-    # "X-Project-Id":    "<YOUR_PROJECT_ID>",                 # 프로젝트 식별
-    # "X-Tenant":        "<YOUR_TENANT_ID>",                  # 멀티 테넌트
-    # "X-Request-Source": "deep-doc-pipeline",                # 호출 출처 태깅
+    # "Authorization": "Bearer <YOUR_TOKEN>",
 }
-# 환경변수 병합 (선택)
+# Merge from env
 _extra = os.getenv("OPENAI_EXTRA_HEADERS")
 if _extra:
     try:
@@ -67,16 +48,13 @@ if _extra:
         print(f"[WARN] OPENAI_EXTRA_HEADERS JSON 파싱 실패: {_extra}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 호출 제한 (Rate Limiting)
+# Rate Limiting
 # ──────────────────────────────────────────────────────────────────────────────
-# 200건 이상 데이터 처리 시 Send 병렬 디스패치로 API 폭주를 방지.
-# LLM_MAX_RPM: 분당 최대 호출 수 (기본 12 → 실측 10~15/min 범위)
-# LLM_MAX_CONCURRENT: 동시 호출 상한 (스레드 자원 보호)
 LLM_MAX_RPM: int = int(os.getenv("LLM_MAX_RPM", "12"))
 LLM_MAX_CONCURRENT: int = int(os.getenv("LLM_MAX_CONCURRENT", "5"))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 역할별 모델 분리 (deep-doc-pipeline 고유 요구사항)
+# Per-role model override
 # ──────────────────────────────────────────────────────────────────────────────
 _ROLE_ENV_MAP: Dict[str, str] = {
     "extractor": "EXTRACTOR_MODEL",

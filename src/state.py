@@ -1,8 +1,5 @@
 """
 LangGraph global state.
-
-v1.3: Whitepaper-only (target_format removed).
-      Added translation stage fields (English → Korean).
 """
 from __future__ import annotations
 import operator

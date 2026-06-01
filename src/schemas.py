@@ -1,9 +1,6 @@
 """
 Pydantic schema definitions.
 All LLM responses are validated through these schemas via extract_json + model_validate.
-
-v1.3: All field descriptions in English (LLM English-output enforcement).
-      Added TranslationCheckResult for EN→KR translation verification.
 """
 from __future__ import annotations
 from typing import List

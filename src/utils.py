@@ -1,9 +1,5 @@
 """
-Deterministic Pure Python logic.
-No LLM calls allowed. Date/filter/assembly/extraction operations go here.
-
-v1.3: English output for compile_sections and format_events_for_prompt.
-      Added extract_proper_nouns for translation preservation.
+Deterministic Pure Python logic. No LLM calls allowed.
 """
 from __future__ import annotations
 import re

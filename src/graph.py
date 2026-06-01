@@ -1,5 +1,5 @@
 """
-LangGraph 그래프 조립.
+LangGraph graph assembly.
 """
 from __future__ import annotations
 from langgraph.graph import StateGraph, START, END
@@ -27,16 +27,16 @@ def build_graph():
     g.add_conditional_edges("chrono_sorter", N.fanout_to_period_summarizer, ["period_summarizer"])
     g.add_edge("period_summarizer", "theme_analyzer")
 
-    # ── Whitepaper-only (v1.3: status_report removed)
+    # ── Phase 3: Planning
     g.add_node("draft_planner", N.draft_planner_node)
     g.add_node("planner_critique", N.planner_critique_node)
 
     g.add_edge("theme_analyzer", "draft_planner")
 
-    # ── Phase 4-B [1단계]: 기획 루프
+    # ── Phase 3 loop: planner → critique
     g.add_edge("draft_planner", "planner_critique")
 
-    # ── Phase 4-B [2단계]: 집필 루프
+    # ── Phase 4: Writing loop
     g.add_node("init_writing", N.init_writing_node)
     g.add_node("section_writer", N.section_writer_node)
     g.add_node("fact_checker", N.fact_checker_node)
@@ -62,7 +62,7 @@ def build_graph():
     )
     g.add_edge("retry_section", "section_writer")
 
-    # save 이후: 다음 섹션 or compiler
+    # After save: next section or compiler
     g.add_conditional_edges(
         "save_section",
         N.route_next_section,
@@ -74,7 +74,7 @@ def build_graph():
         {"section_writer": "section_writer", "compiler": "compiler"},
     )
 
-    # ── Phase 4-B [3단계]: 조립 → 윤문 → 2차 검증
+    # ── Phase 4: Assembly → Polish → 2nd fact-check
     g.add_node("compiler", N.compiler_node)
     g.add_node("polish", N.polish_node)
     g.add_node("final_fact_checker", N.final_fact_checker_node)
