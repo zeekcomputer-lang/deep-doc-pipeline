@@ -27,6 +27,8 @@ from .utils import (
     validate_outline_periods, compile_sections, format_events_for_prompt,
     split_compiled_by_section, split_section_header_body,
     extract_proper_nouns,
+    extract_years_from_content, extract_sections_for_year,
+    count_expected_periods, validate_korean_structure,
 )
 from .context_guard import (
     BUDGET_BYTES, fits_budget, estimate_guard_overhead, available_data_budget,
@@ -878,12 +880,13 @@ def fallback_to_compiled_node(state: GraphState) -> Dict[str, Any]:
     return {"final_output": state["final_compiled"]}
 
 
+
 # ══════════════════════════════════════════════════════════════
-# Phase 5: Translation (English → Korean)
+# Phase 5: Translation / Rendering (English → Korean)
 # ══════════════════════════════════════════════════════════════
 
 def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
-    """Pure Python: save English output + extract proper nouns for translation."""
+    """Pure Python: save English output + extract proper nouns for rendering."""
     english = state["final_output"]
     nouns = extract_proper_nouns(english)
     print(f"[prepare_translation] English output saved ({len(english)} chars), "
@@ -897,130 +900,174 @@ def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
     }
 
 
-def translate_node(state: GraphState) -> Dict[str, Any]:
-    """Translate English whitepaper to Korean with proper noun preservation.
+# ──────────────────────────────────────────────────────────────
+# Rendering System Prompt Builder
+# ──────────────────────────────────────────────────────────────
 
-    Strategy:
-      1. Try full-document translation if within budget.
-      2. If budget exceeded, translate section by section.
-      3. Structural elements (doc header, audit log) translated via
-         deterministic string replacement (no LLM hallucination risk).
+def _build_render_prompt(
+    current_year: str,
+    previous_context: str,
+    proper_nouns: List[str],
+    retry_feedback: str = "",
+) -> str:
+    """Build the Korean whitepaper rendering system prompt for a specific year.
+
+    Incorporates the senior editor style guide: year/month heading structure,
+    integrated narrative, inline KPI emphasis, formal tone (~다/~함/~구축됨).
+    """
+    noun_ref = "\n".join(f"  - {n}" for n in proper_nouns[:100]) if proper_nouns else "(없음)"
+
+    if previous_context:
+        prev_section = (
+            f"- 이전 시점의 핵심 흐름: {previous_context}\n"
+            " (위 흐름을 바탕으로 이번 연도의 서술을 이어가며 전체 문맥의 연속성을 확보합니다.)"
+        )
+    else:
+        prev_section = "- 첫 연도이므로 이전 맥락 없이 시작합니다."
+
+    retry_hint = ""
+    if retry_feedback:
+        retry_hint = (
+            f"\n\n[이전 렌더링 반려 사유 — 반드시 반영]\n{retry_feedback}\n"
+        )
+
+    return (
+        "# Role\n"
+        "당신은 방대한 데이터를 엮어 유려하고 깊이 있는 공식 비즈니스 백서(Whitepaper)로 "
+        "완성하는 수석 에디터입니다.\n"
+        f"제공받은 [{current_year}년] 단위의 영문 초안 데이터를 한국어 마크다운 포맷의 "
+        "백서로 최종 렌더링하는 임무를 수행합니다.\n\n"
+        "# Context\n"
+        f"{prev_section}\n\n"
+        "# Formatting & Style Guidelines\n\n"
+        "1. 헤딩(Heading) 구조 및 텍스트 전개\n"
+        f" - 최상위 구분자인 연도는 ## {current_year}년으로 작성합니다.\n"
+        f" - 하위 구분자인 월은 ### {current_year}년 X월: [해당 월을 관통하는 핵심 요약 1줄] "
+        "형식으로 지정합니다.\n"
+        " - 마크다운 헤딩은 오직 ##와 ### 두 가지 수준만 사용합니다.\n"
+        " - 월별 상세 내용은 소제목 분리 없이, 주제별로 문단(Paragraph)을 나누어 "
+        "논리적인 서술형 텍스트로 전개합니다.\n\n"
+        "2. 밀도 있는 통합 서술 (Integrated Narrative)\n"
+        " - 제공된 초안의 모든 세부 정보와 배경 상황을 본문 텍스트에 온전히 풀어내어 "
+        "백서로서의 깊이를 확보합니다.\n"
+        " - 다수의 구체적인 실행 내역이나 팩트를 나열해야 할 경우, 도입 문장 뒤에 "
+        "글머리 기호(-)를 연결하여 가독성 있게 정리합니다.\n\n"
+        "3. 유동적 KPI의 인라인(Inline) 강조\n"
+        " - 연/월별로 불규칙하게 나타나는 성과 지표(KPI) 및 수치 데이터는 본문 서술의 "
+        "흐름 속에 자연스럽게 포함합니다.\n"
+        " - 핵심 지표명, 수치, 주요 프로젝트명에는 굵은 글씨(Bold)를 적용하여 독자가 "
+        "시각적으로 쉽게 인지하도록 강조합니다.\n\n"
+        "4. 일관된 Tone & Manner 및 사실 기반 서술\n"
+        " - 공식 백서의 신뢰감을 부여하기 위해 객관적이고 명확한 평어체(~다, ~함, ~구축됨)를 "
+        "일관되게 적용합니다.\n"
+        " - 제공된 영문 초안에 명시된 사실, 날짜, 수치 정보만을 전적으로 활용하여 "
+        "문장을 구성합니다.\n"
+        " - 영문 초안에 없는 사실, 날짜, 수치를 절대 추가하지 않습니다.\n\n"
+        "5. 고유명사 보존\n"
+        " - 모든 고유명사(회사명, 프로젝트명, 인명, 기술 용어, 약어)는 원문 그대로 유지합니다.\n"
+        " - 음역(transliteration)이나 번역을 하지 않습니다.\n\n"
+        "6. 검증 미완료 섹션 경고 처리\n"
+        " - 영문 초안에 \"⚠️ **Unverified Section**\"으로 시작하는 경고 블록이 있으면,\n"
+        "   해당 경고를 한국어로 번역하여 그대로 유지합니다.\n"
+        "   (예: > ⚠️ **검증 미완료 섹션** — 자동 팩트체크 3회 실패. 원본 데이터 대조 필요.)\n\n"
+        f"[보존 대상 고유명사 목록]\n{noun_ref}\n\n"
+        "# Output Instruction\n"
+        f"- 렌더링된 백서 본문은 ## {current_year}년 헤딩으로 시작합니다.\n"
+        "- 해당 연도의 마지막 데이터를 서술하는 문장으로 종료합니다."
+        f"{retry_hint}"
+    )
+
+
+def translate_node(state: GraphState) -> Dict[str, Any]:
+    """Render English whitepaper into styled Korean whitepaper.
+
+    Applies the senior editor style guide:
+      - Year/month heading structure (## YYYY년 / ### YYYY년 X월: [요약])
+      - Dense integrated narrative with inline KPI emphasis
+      - Formal objective tone (~다, ~함, ~구축됨)
+      - Fact-only constraint + proper noun preservation
+
+    Multi-year data is rendered year by year with previous_context accumulation
+    to maintain narrative continuity across year boundaries.
     """
     english = state["english_output"]
     proper_nouns = state.get("proper_nouns", [])
     retry = state.get("translation_retry_count", 0)
     feedback = state.get("translation_feedback", "")
 
-    # Build proper noun reference
-    noun_ref = "\n".join(f"  - {n}" for n in proper_nouns[:100]) if proper_nouns else "(none)"
-
-    retry_hint = ""
-    if retry > 0 and feedback:
-        retry_hint = f"\n\n[PREVIOUS TRANSLATION REJECTED — fix these issues]\n{feedback}\n"
-
-    system_prompt = (
-        "You are a professional English-to-Korean translator specializing in "
-        "technical and business documents.\n\n"
-        "CRITICAL RULES:\n"
-        "1. Preserve ALL proper nouns EXACTLY as they appear in English "
-        "(do NOT transliterate, translate, or modify them).\n"
-        "2. Preserve all dates (YYYY-MM-DD, YYYY-MM), numbers, percentages, "
-        "and units exactly as written.\n"
-        "3. Do NOT add any information not present in the English original.\n"
-        "4. Do NOT omit any information from the English original.\n"
-        "5. Maintain all markdown formatting: headers (##), lists (-), "
-        "blockquotes (>), bold (**), italics (_), warning blocks.\n"
-        "6. Produce natural, fluent Korean suitable for a formal whitepaper.\n"
-        "7. Translate section headers and descriptive text to Korean, "
-        "but keep proper nouns within them unchanged.\n\n"
-        f"[PROPER NOUNS — PRESERVE EXACTLY AS-IS]\n{noun_ref}"
-    )
-    guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
-
-    # --- Attempt 1: Full-document translation ---
-    full_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": (
-            f"Translate the following English whitepaper to Korean:{retry_hint}\n\n"
-            f"{english}\n\nKorean translation:"
-        )},
-    ]
-    full_size = measure_messages_bytes(full_messages) + guard_overhead
-
-    if full_size <= BUDGET_BYTES:
-        result = structured_call(
-            full_messages, PolishedDocument, role="writer",
-            temperature=0.1, stream=True,
-        )
-        print(f"[translate] full-document, retry={retry}, len={len(result.content)}")
-        return {"final_output": result.content}
-
-    # --- Attempt 2: Section-by-section translation ---
+    # Extract structure from English content
     doc_header, sections, audit = split_compiled_by_section(english)
-    translated_parts: List[str] = []
+    years = extract_years_from_content(english)
 
-    for i, section in enumerate(sections):
-        sec_messages = [
+    if not years:
+        years = ["2026"]  # safe fallback
+
+    guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
+    retry_feedback = feedback if retry > 0 else ""
+
+    rendered_parts: List[str] = []
+    previous_context = ""
+
+    for yi, year in enumerate(years):
+        year_sections = extract_sections_for_year(sections, year)
+        if not year_sections:
+            continue
+
+        year_text = "\n".join(year_sections)
+        system_prompt = _build_render_prompt(
+            year, previous_context, proper_nouns, retry_feedback,
+        )
+
+        # --- Attempt 1: Full-year rendering ---
+        full_msgs = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": (
-                f"Translate this section to Korean:{retry_hint}\n\n"
-                f"{section}\n\nKorean translation:"
-            )},
+            {"role": "user", "content": f"# Input Draft Text\n\n{year_text}"},
         ]
-        sec_size = measure_messages_bytes(sec_messages) + guard_overhead
+        full_size = measure_messages_bytes(full_msgs) + guard_overhead
 
-        if sec_size <= BUDGET_BYTES:
-            sec_result = structured_call(
-                sec_messages, PolishedDocument, role="writer",
-                temperature=0.1, stream=True,
+        if full_size <= BUDGET_BYTES:
+            result = structured_call(
+                full_msgs, PolishedDocument, role="writer",
+                temperature=0.2, stream=True,
             )
-            translated_parts.append(sec_result.content)
+            rendered_parts.append(result.content)
+            print(f"[translate] year={year} full-render, len={len(result.content)}")
         else:
-            # Section too large — paragraph by paragraph
-            header, body = split_section_header_body(section)
-            paragraphs = body.split("\n\n")
-            translated_paras: List[str] = []
-
-            # Translate header separately
-            hdr_msgs = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": (
-                    f"Translate this markdown header to Korean (keep proper nouns):\n\n"
-                    f"{header}\n\nKorean:"
-                )},
-            ]
-            hdr_size = measure_messages_bytes(hdr_msgs) + guard_overhead
-            if hdr_size <= BUDGET_BYTES:
-                hdr_result = structured_call(hdr_msgs, PolishedDocument, role="writer", temperature=0.1)
-                kr_header = hdr_result.content
-            else:
-                # Deterministic fallback for header
-                kr_header = header.replace("Target period:", "대상 기간:")
-
-            for para in paragraphs:
-                if not para.strip():
-                    translated_paras.append(para)
-                    continue
-                para_msgs = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": (
-                        f"Translate to Korean:\n\n{para}\n\nKorean:"
-                    )},
+            # --- Attempt 2: Section-by-section within year ---
+            year_rendered: List[str] = [f"## {year}년\n"]
+            # Adjust prompt: skip ## year heading since it's manually prepended
+            month_prompt = system_prompt.replace(
+                f"렌더링된 백서 본문은 ## {year}년 헤딩으로 시작합니다.",
+                f"### {year}년 X월 헤딩으로 바로 시작합니다 "
+                f"(## {year}년 헤딩은 이미 삽입되어 있으므로 생략).",
+            )
+            for si, sec in enumerate(year_sections):
+                sec_msgs = [
+                    {"role": "system", "content": month_prompt},
+                    {"role": "user", "content": f"# Input Draft Text\n\n{sec}"},
                 ]
-                para_size = measure_messages_bytes(para_msgs) + guard_overhead
-                if para_size <= BUDGET_BYTES:
-                    para_result = structured_call(
-                        para_msgs, PolishedDocument, role="writer", temperature=0.1,
+                sec_size = measure_messages_bytes(sec_msgs) + guard_overhead
+
+                if sec_size <= BUDGET_BYTES:
+                    sec_result = structured_call(
+                        sec_msgs, PolishedDocument, role="writer",
+                        temperature=0.2, stream=True,
                     )
-                    translated_paras.append(para_result.content)
+                    year_rendered.append(sec_result.content)
                 else:
-                    translated_paras.append(para)  # Keep English if too large
-            translated_parts.append(kr_header + "\n\n".join(translated_paras))
+                    # Paragraph-level fallback: keep original section
+                    year_rendered.append(sec)
+                print(f"[translate] year={year} section {si+1}/{len(year_sections)} done")
 
-        print(f"[translate] section {i + 1}/{len(sections)} done")
+            rendered_parts.append("\n\n".join(year_rendered))
+            print(f"[translate] year={year} section-by-section render")
 
-    # Deterministic structural translations (no LLM needed)
-    kr_header = doc_header.replace("# Comprehensive Whitepaper", "# 종합 백서")
+        # Accumulate previous_context for narrative continuity across years
+        if rendered_parts:
+            last = rendered_parts[-1]
+            previous_context = last[-500:] if len(last) > 500 else last
+
+    # Deterministic audit log translation (no LLM needed)
     kr_audit = ""
     if audit:
         kr_audit = (
@@ -1029,17 +1076,21 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
             .replace("Unverified section indices:", "검증 미완료 섹션 인덱스:")
         )
 
-    final = kr_header + "\n".join(translated_parts) + kr_audit
-    print(f"[translate] section-by-section, retry={retry}, len={len(final)}")
+    final = "\n\n".join(rendered_parts)
+    if kr_audit:
+        final += "\n" + kr_audit
+
+    print(f"[translate] done: years={years} retry={retry} len={len(final)}")
     return {"final_output": final}
 
 
 def translation_checker_node(state: GraphState) -> Dict[str, Any]:
-    """Verify translation quality: proper noun preservation + semantic fidelity.
+    """Verify rendered Korean whitepaper quality.
 
     Defense layers:
-      1. Pure Python: check proper noun presence in Korean text.
-      2. LLM spot-check: sample first section pair for semantic fidelity.
+      1. Pure Python: proper noun presence check.
+      2. Structural: year/month heading format validation (## YYYY년 / ### YYYY년 X월:).
+      3. LLM spot-check: first year's content for semantic fidelity.
     """
     english = state["english_output"]
     korean = state["final_output"]
@@ -1052,62 +1103,64 @@ def translation_checker_node(state: GraphState) -> Dict[str, Any]:
 
     if missing_ratio > 0.3:
         msg = f"Too many proper nouns missing ({len(missing)}/{len(proper_nouns)}): {missing[:15]}"
-        print(f"[translation_checker] REJECTED (python): {msg}")
+        print(f"[translation_checker] REJECTED (proper nouns): {msg}")
         return {
             "is_translation_approved": False,
             "translation_feedback": msg,
         }
 
-    # --- Layer 2: Structural integrity ---
-    _, en_sections, _ = split_compiled_by_section(english)
-    _, kr_sections, _ = split_compiled_by_section(korean)
-    if len(en_sections) > 0 and len(kr_sections) == 0:
-        msg = "Translation lost all section structure"
-        print(f"[translation_checker] REJECTED (structure): {msg}")
+    # --- Layer 2: Structural validation (## year / ### month headings) ---
+    expected_count = count_expected_periods(english)
+    struct_ok, struct_msg = validate_korean_structure(korean, expected_count)
+
+    if not struct_ok:
+        print(f"[translation_checker] REJECTED (structure): {struct_msg}")
         return {
             "is_translation_approved": False,
-            "translation_feedback": msg,
+            "translation_feedback": struct_msg,
         }
+    print(f"[translation_checker] structure check: {struct_msg}")
 
-    # --- Layer 3: LLM spot-check on first section pair ---
-    if en_sections and kr_sections:
-        en_sample = en_sections[0][:2000]
-        kr_sample = kr_sections[0][:2000]
+    # --- Layer 3: LLM spot-check on first ~2000 chars ---
+    en_sample = english[:2000]
+    kr_sample = korean[:2000]
 
-        spot_system = (
-            "You are a translation quality auditor. Compare the English original "
-            "and Korean translation below. Check for:\n"
-            "1. Proper nouns, dates, or numbers that were altered or missing\n"
-            "2. Information added that is not in the English original\n"
-            "3. Information from the English original that was omitted\n"
-            "Report any issues found. Respond in English."
+    spot_system = (
+        "You are a translation quality auditor. Compare the English source whitepaper "
+        "and the rendered Korean whitepaper below. The Korean version uses a different "
+        "heading structure (## year / ### month) which is expected and correct. Check for:\n"
+        "1. Proper nouns, dates, or numbers that were altered, transliterated, or missing\n"
+        "2. Factual information added that is not in the English source\n"
+        "3. Factual information from the English source that was omitted\n"
+        "4. Tone consistency (formal Korean ~다/~함/~구축됨 expected)\n"
+        "Report any issues. Respond in English."
+    )
+    spot_messages = [
+        {"role": "system", "content": spot_system},
+        {"role": "user", "content": (
+            f"[ENGLISH SOURCE]\n{en_sample}\n\n"
+            f"[KOREAN RENDERED]\n{kr_sample}\n\n"
+            "Verification result:"
+        )},
+    ]
+    guard_overhead = estimate_guard_overhead(TranslationCheckResult.model_json_schema())
+    spot_size = measure_messages_bytes(spot_messages) + guard_overhead
+
+    if spot_size <= BUDGET_BYTES:
+        result = structured_call(
+            spot_messages, TranslationCheckResult, role="judge", temperature=0.0,
         )
-        spot_messages = [
-            {"role": "system", "content": spot_system},
-            {"role": "user", "content": (
-                f"[ENGLISH ORIGINAL]\n{en_sample}\n\n"
-                f"[KOREAN TRANSLATION]\n{kr_sample}\n\n"
-                "Verification result:"
-            )},
-        ]
-        guard_overhead = estimate_guard_overhead(TranslationCheckResult.model_json_schema())
-        spot_size = measure_messages_bytes(spot_messages) + guard_overhead
-
-        if spot_size <= BUDGET_BYTES:
-            result = structured_call(
-                spot_messages, TranslationCheckResult, role="judge", temperature=0.0,
-            )
-            if not result.is_approved:
-                all_missing = list(set(missing + result.missing_terms))
-                msg = f"LLM spot-check failed: {result.feedback}. Missing: {all_missing[:10]}"
-                print(f"[translation_checker] REJECTED (LLM): {msg}")
-                return {
-                    "is_translation_approved": False,
-                    "translation_feedback": msg,
-                }
-            print(f"[translation_checker] LLM spot-check passed: {result.feedback[:60]}")
-        else:
-            print(f"[translation_checker] LLM spot-check skipped (budget exceeded)")
+        if not result.is_approved:
+            all_missing = list(set(missing + result.missing_terms))
+            msg = f"LLM spot-check failed: {result.feedback}. Missing: {all_missing[:10]}"
+            print(f"[translation_checker] REJECTED (LLM): {msg}")
+            return {
+                "is_translation_approved": False,
+                "translation_feedback": msg,
+            }
+        print(f"[translation_checker] LLM spot-check passed: {result.feedback[:60]}")
+    else:
+        print("[translation_checker] LLM spot-check skipped (budget exceeded)")
 
     # All checks passed
     if missing:
@@ -1115,7 +1168,7 @@ def translation_checker_node(state: GraphState) -> Dict[str, Any]:
     print(f"[translation_checker] APPROVED retry={retry}")
     return {
         "is_translation_approved": True,
-        "translation_feedback": "Translation approved" + (
+        "translation_feedback": "Rendering approved" + (
             f" (minor missing: {missing})" if missing else ""
         ),
     }
@@ -1133,17 +1186,17 @@ def route_translation(state: GraphState) -> str:
 def retry_translate_node(state: GraphState) -> Dict[str, Any]:
     """Increment retry counter for translation re-attempt."""
     retry = state.get("translation_retry_count", 0) + 1
-    print(f"[retry_translate] retrying translation (attempt {retry})")
+    print(f"[retry_translate] retrying rendering (attempt {retry})")
     return {"translation_retry_count": retry}
 
 
 def fallback_english_node(state: GraphState) -> Dict[str, Any]:
-    """Translation verification failed — keep English version with warning header."""
+    """Rendering verification failed — keep English version with warning header."""
     english = state["english_output"]
     warned = (
-        "> ⚠️ **Translation Notice** — English-to-Korean translation could not be verified "
+        "> ⚠️ **Translation Notice** — English-to-Korean rendering could not be verified "
         "after multiple attempts. English original is preserved below.\n\n"
         + english
     )
-    print("[fallback_english] Translation verification failed — keeping English output")
+    print("[fallback_english] Rendering verification failed — keeping English output")
     return {"final_output": warned}

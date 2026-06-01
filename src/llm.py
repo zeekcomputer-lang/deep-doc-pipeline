@@ -284,7 +284,8 @@ def structured_call(
         "- No code fences (```), explanations, preambles, postambles, or chain-of-thought.\n"
         "- The first character of your response MUST be '{'.\n"
         "- Use double quotes for all keys and strings. No trailing commas.\n"
-        "- All text content MUST be in English. Preserve proper nouns in their original form.\n"
+        # English enforcement is handled per-node via _EN_ENFORCE, not here.
+        # The translation/rendering stage outputs Korean, so this guard stays language-neutral.
         f"\n[JSON Schema — follow this structure exactly]\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n"
     )
 

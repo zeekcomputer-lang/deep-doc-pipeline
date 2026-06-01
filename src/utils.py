@@ -8,7 +8,7 @@ v1.3: English output for compile_sections and format_events_for_prompt.
 from __future__ import annotations
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Tuple
 
 
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -212,3 +212,58 @@ def extract_proper_nouns(text: str) -> List[str]:
     candidates.update(re.findall(r'`([^`]+)`', text))
 
     return sorted(c for c in candidates if len(c) >= 2)
+
+
+# ────────────────────────────────────────────────────────────
+# Year / Period Extraction (for year-by-year rendering)
+# ────────────────────────────────────────────────────────────
+
+def extract_years_from_content(text: str) -> List[str]:
+    """Extract sorted unique years from _Target period: YYYY-MM_ markers.
+
+    Falls back to any YYYY-MM date pattern if no markers found.
+    """
+    periods = re.findall(r'_Target period:\s*(\d{4})-\d{2}_', text)
+    if not periods:
+        periods = re.findall(r'\b(\d{4})-\d{2}', text)
+    return sorted(set(periods))
+
+
+def extract_sections_for_year(sections: List[str], year: str) -> List[str]:
+    """Filter sections belonging to a specific year based on Target period marker."""
+    return [s for s in sections if f'_Target period: {year}-' in s]
+
+
+def count_expected_periods(text: str) -> int:
+    """Count unique YYYY-MM periods from _Target period:_ markers."""
+    periods = re.findall(r'_Target period:\s*(\d{4}-\d{2})_', text)
+    return len(set(periods))
+
+
+def validate_korean_structure(korean: str, expected_period_count: int) -> Tuple[bool, str]:
+    """Validate Korean whitepaper heading structure.
+
+    Checks for:
+      - ## YYYY년 year headings
+      - ### YYYY년 X월: month headings
+      - Approximate month count vs expected
+
+    Returns:
+        (is_valid, message) — message is rejection reason or OK summary.
+    """
+    year_headings = re.findall(r'^## \d{4}년', korean, re.MULTILINE)
+    month_headings = re.findall(r'^### \d{4}년 \d{1,2}월:', korean, re.MULTILINE)
+
+    if not year_headings:
+        return False, "No year headings (## YYYY년) found in rendered output"
+
+    if expected_period_count > 0 and not month_headings:
+        return False, "No month headings (### YYYY년 X월:) found despite having period data"
+
+    if expected_period_count > 0 and len(month_headings) < expected_period_count * 0.5:
+        return False, (
+            f"Expected ~{expected_period_count} month sections, got {len(month_headings)}. "
+            f"Headings: {month_headings[:5]}"
+        )
+
+    return True, f"Structure OK: {len(year_headings)} years, {len(month_headings)} months"
