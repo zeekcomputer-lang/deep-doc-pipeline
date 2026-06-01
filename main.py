@@ -30,7 +30,8 @@ from src.logger import reset_stats, summary
 
 def parse_args():
     p = argparse.ArgumentParser(description="Deep Doc Pipeline — Whitepaper Generator (EN→KR)")
-    p.add_argument("--output", default="./output.md", help="최종 마크다운 저장 경로")
+    p.add_argument("--output", default="./output.md", help="최종 한글 백서 저장 경로")
+    p.add_argument("--output-en", default=None, help="영문 원본 저장 경로 (기본: output 경로에 _en 붙임)")
     return p.parse_args()
 
 
@@ -73,8 +74,20 @@ def main():
     final_state = graph.invoke(initial_state, config={"recursion_limit": 200})
 
     final = final_state.get("final_output", "(빈 결과)")
+    english = final_state.get("english_output", "")
+
+    # 한글 백서 저장
     out_path = Path(args.output)
     out_path.write_text(final, encoding="utf-8")
+
+    # 영문 원본 항상 저장
+    if args.output_en:
+        en_path = Path(args.output_en)
+    else:
+        stem = out_path.stem
+        en_path = out_path.with_name(f"{stem}_en{out_path.suffix}")
+    if english:
+        en_path.write_text(english, encoding="utf-8")
 
     # 실행 통계
     stats = summary()
@@ -96,11 +109,9 @@ def main():
         print(f"  ⚠️ 미검증 섹션 : {sorted(unv)}")
     nouns = final_state.get("proper_nouns", [])
     print(f"  고유명사 추출 : {len(nouns)}개")
-    if final_state.get("english_output"):
-        print(f"  영문 백서    : {len(final_state['english_output']):,} chars")
-        print(f"  한글 렌더링  : {len(final):,} chars")
-    print("-" * 70)
-    print(f"  결과 파일    : {out_path.resolve()}")
+    if english:
+        print(f"  영문 원본    : {len(english):,} chars → {en_path.resolve()}")
+    print(f"  한글 렌더링  : {len(final):,} chars → {out_path.resolve()}")
     print("=" * 70)
 
 

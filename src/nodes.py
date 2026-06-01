@@ -1201,11 +1201,11 @@ def fallback_english_node(state: GraphState) -> Dict[str, Any]:
     total_attempts = state.get("translation_retry_count", 0) + 1
 
     if not candidates:
-        plog("fallback_english", "No candidates collected — keeping English output")
+        plog("fallback_english", "No candidates collected — English original saved separately")
         return {
             "final_output": (
-                "> ⚠️ **렌더링 실패** — 한국어 변환 후보 없음. 영문 원본 보존.\n\n"
-                + english
+                "> ⚠️ **렌더링 실패** — 한국어 변환 후보 없음. "
+                "영문 원본은 _en 파일을 참조하십시오.\n"
             )
         }
 
