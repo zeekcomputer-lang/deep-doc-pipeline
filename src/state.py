@@ -41,14 +41,9 @@ class GraphState(TypedDict, total=False):
     unverified_sections: Annotated[List[int], operator.add]  # v1.1: audit log
 
     # [6. Final Assembly (English)]
-    final_compiled: str                             # v1.1: pre-polish pure assembly
-    final_output: str                               # final result (after translation = Korean)
-    polish_retry_count: int
+    final_compiled: str
+    final_output: str
 
     # [7. Translation (English → Korean)]
     english_output: str
     proper_nouns: List[str]
-    translation_retry_count: int
-    is_translation_approved: bool
-    translation_feedback: str
-    translation_candidates: Annotated[List[Dict], operator.add]  # best-of-N tracking

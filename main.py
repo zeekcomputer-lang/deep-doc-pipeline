@@ -70,10 +70,7 @@ def main():
         "hallucinated_tokens": [],
         "outline_retry_count": 0,
         "section_retry_count": 0,
-        "polish_retry_count": 0,
         "proper_nouns": [],
-        "translation_retry_count": 0,
-        "translation_candidates": [],
     }
 
     # recursion_limit를 충분히 늘려 루프 동작 보장

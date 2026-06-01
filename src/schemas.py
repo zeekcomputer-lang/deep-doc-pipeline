@@ -82,20 +82,3 @@ class PolishedDocument(BaseModel):
     content: str = Field(..., description="Final markdown body with only sentence flow refined")
 
 
-# ──────────────────────────────────────────────────────────────
-# Translation Stage (English → Korean)
-# ──────────────────────────────────────────────────────────────
-class TranslationCheckResult(BaseModel):
-    """Translation verification result for EN→KR stage."""
-    is_approved: bool = Field(
-        ..., description="True if translation faithfully preserves all facts and proper nouns"
-    )
-    missing_terms: List[str] = Field(
-        default_factory=list,
-        description="Proper nouns/terms present in English but missing or altered in Korean"
-    )
-    added_terms: List[str] = Field(
-        default_factory=list,
-        description="Terms in Korean translation not found in English original"
-    )
-    feedback: str = Field(..., description="Specific issues found, or approval comment")

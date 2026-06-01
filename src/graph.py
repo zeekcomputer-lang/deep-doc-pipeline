@@ -74,46 +74,18 @@ def build_graph():
         {"section_writer": "section_writer", "compiler": "compiler"},
     )
 
-    # ── Phase 4: Assembly → Polish → 2nd fact-check
+    # ── Phase 4: Assembly → Polish
     g.add_node("compiler", N.compiler_node)
     g.add_node("polish", N.polish_node)
-    g.add_node("final_fact_checker", N.final_fact_checker_node)
-    g.add_node("retry_polish", N.retry_polish_node)
-    g.add_node("fallback_to_compiled", N.fallback_to_compiled_node)
 
     g.add_edge("compiler", "polish")
-    g.add_edge("polish", "final_fact_checker")
-    g.add_conditional_edges(
-        "final_fact_checker",
-        N.route_final_check,
-        {
-            "prepare_translation": "prepare_translation",
-            "retry_polish": "retry_polish",
-            "fallback_to_compiled": "fallback_to_compiled",
-        },
-    )
-    g.add_edge("retry_polish", "polish")
-    g.add_edge("fallback_to_compiled", "prepare_translation")
 
     # ── Phase 5: Translation (English → Korean)
     g.add_node("prepare_translation", N.prepare_translation_node)
     g.add_node("translate", N.translate_node)
-    g.add_node("translation_checker", N.translation_checker_node)
-    g.add_node("retry_translate", N.retry_translate_node)
-    g.add_node("fallback_english", N.fallback_english_node)
 
+    g.add_edge("polish", "prepare_translation")
     g.add_edge("prepare_translation", "translate")
-    g.add_edge("translate", "translation_checker")
-    g.add_conditional_edges(
-        "translation_checker",
-        N.route_translation,
-        {
-            "END": END,
-            "retry_translate": "retry_translate",
-            "fallback_english": "fallback_english",
-        },
-    )
-    g.add_edge("retry_translate", "translate")
-    g.add_edge("fallback_english", END)
+    g.add_edge("translate", END)
 
     return g.compile()

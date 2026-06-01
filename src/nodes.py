@@ -13,7 +13,6 @@ from .schemas import (
     ExtractedEvent, PeriodSummary, GlobalTheme,
     Outline, OutlineCritique,
     SectionDraft, FactCheckResult, PolishedDocument,
-    TranslationCheckResult,
 )
 from .llm import structured_call, Timeout504Error, effective_budget, _504_MAX_STEPS
 from .utils import (
@@ -22,7 +21,6 @@ from .utils import (
     split_compiled_by_section, split_section_header_body,
     extract_proper_nouns,
     extract_years_from_content, extract_sections_for_year,
-    count_expected_periods, validate_korean_structure,
 )
 from .logger import plog, psub
 from .context_guard import (
@@ -738,7 +736,7 @@ def compiler_node(state: GraphState) -> Dict[str, Any]:
     unverified = state.get("unverified_sections", [])
     compiled = compile_sections(outline, completed, unverified)
     plog("compiler", f"sections={len(completed)} unverified={unverified} len={len(compiled)}")
-    return {"final_compiled": compiled, "polish_retry_count": 0}
+    return {"final_compiled": compiled}
 
 
 @retry_on_504
@@ -815,110 +813,6 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
     return {"final_output": final}
 
 
-@retry_on_504
-def final_fact_checker_node(state: GraphState) -> Dict[str, Any]:
-    """Section-by-section 2nd fact-check + streaming. Prevents 504 on large contexts.
-    v1.2: Skips section pairs exceeding budget (auto-approve).
-    v1.3: English output enforced.
-    """
-    original = state["final_compiled"]
-    polished = state["final_output"]
-    retry_count = state.get("polish_retry_count", 0)
-
-    _, orig_sections, _ = split_compiled_by_section(original)
-    _, pol_sections, _ = split_compiled_by_section(polished)
-
-    system_prompt = (
-        "You are the final auditor. Compare the original and polished versions. "
-        "Verify that no proper nouns, dates, numbers, or facts were added or altered. "
-        "Sentence flow changes are allowed; only factual changes count as hallucination."
-        + _EN_ENFORCE
-    )
-    guard_overhead = estimate_guard_overhead(FactCheckResult.model_json_schema())
-
-    # Section count mismatch → full document comparison fallback
-    if len(orig_sections) != len(pol_sections) or not orig_sections:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": (
-                f"[ORIGINAL]\n{original}\n\n[POLISHED]\n{polished}\n\nVerification result:"
-            )},
-        ]
-        size = measure_messages_bytes(messages) + guard_overhead
-        if size > effective_budget():
-            plog("final_fact_checker", f"fallback-full budget exceeded ({size/1024:.1f}KB) — auto-approve")
-            return {
-                "is_draft_approved": True,
-                "draft_feedback": f"[Budget exceeded auto-approve] Full comparison not possible ({size/1024:.1f}KB)",
-            }
-        result = structured_call(messages, FactCheckResult, role="judge",
-                                temperature=0.0, stream=True)
-        plog("final_fact_checker", f"fallback-full approved={result.is_draft_approved} retry={retry_count}")
-        return {
-            "is_draft_approved": result.is_draft_approved,
-            "draft_feedback": result.feedback,
-        }
-
-    # Section-by-section verification
-    all_approved = True
-    feedback_parts: List[str] = []
-
-    for i, (orig, pol) in enumerate(zip(orig_sections, pol_sections)):
-        _, orig_body = split_section_header_body(orig)
-        _, pol_body = split_section_header_body(pol)
-
-        if not orig_body.strip() or orig_body.strip() == pol_body.strip():
-            continue
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": (
-                f"[ORIGINAL]\n{orig_body}\n\n[POLISHED]\n{pol_body}\n\nVerification result:"
-            )},
-        ]
-        size = measure_messages_bytes(messages) + guard_overhead
-
-        if size > effective_budget():
-            plog("final_fact_checker", f"section {i + 1} budget exceeded ({size/1024:.1f}KB) — skipped")
-            continue
-
-        result = structured_call(messages, FactCheckResult, role="judge",
-                                temperature=0.0, stream=True)
-        if not result.is_draft_approved:
-            all_approved = False
-            feedback_parts.append(f"Section {i + 1}: {result.feedback}")
-        plog("final_fact_checker", f"section {i + 1}/{len(orig_sections)} approved={result.is_draft_approved}")
-
-    feedback = "; ".join(feedback_parts) if feedback_parts else "All sections verified"
-    plog("final_fact_checker", f"overall approved={all_approved} retry={retry_count}")
-    return {
-        "is_draft_approved": all_approved,
-        "draft_feedback": feedback,
-    }
-
-
-def route_final_check(state: GraphState) -> str:
-    """Polish verification routing.
-    v1.3: Routes to prepare_translation instead of END on approval.
-    """
-    if state.get("is_draft_approved"):
-        return "prepare_translation"
-    if state.get("polish_retry_count", 0) >= 2:
-        return "fallback_to_compiled"
-    return "retry_polish"
-
-
-def retry_polish_node(state: GraphState) -> Dict[str, Any]:
-    return {"polish_retry_count": state.get("polish_retry_count", 0) + 1}
-
-
-def fallback_to_compiled_node(state: GraphState) -> Dict[str, Any]:
-    """Polish bypass — adopt final_compiled as-is."""
-    plog("fallback_to_compiled", "polish verification failed — adopting assembly output")
-    return {"final_output": state["final_compiled"]}
-
-
-
 # ══════════════════════════════════════════════════════════════
 # Phase 5: Translation / Rendering (English → Korean)
 # ══════════════════════════════════════════════════════════════
@@ -933,7 +827,7 @@ def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
     return {
         "english_output": english,
         "proper_nouns": nouns,
-        "translation_retry_count": 0,
+
     }
 
 
@@ -1030,8 +924,7 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
     """
     english = state["english_output"]
     proper_nouns = state.get("proper_nouns", [])
-    retry = state.get("translation_retry_count", 0)
-    feedback = state.get("translation_feedback", "")
+
 
     # Extract structure from English content
     doc_header, sections, audit = split_compiled_by_section(english)
@@ -1041,7 +934,7 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
         years = ["2026"]  # safe fallback
 
     guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
-    retry_feedback = feedback if retry > 0 else ""
+    retry_feedback = ""
 
     rendered_parts: List[str] = []
     previous_context = ""
@@ -1118,169 +1011,7 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
     if kr_audit:
         final += "\n" + kr_audit
 
-    plog("translate", f"done: years={years} retry={retry} len={len(final)}")
+    plog("translate", f"done: years={years} len={len(final)}")
     return {"final_output": final}
 
 
-@retry_on_504
-def translation_checker_node(state: GraphState) -> Dict[str, Any]:
-    """Verify rendered Korean whitepaper quality.
-
-    Defense layers:
-      1. Pure Python: proper noun presence check (reject if >50% missing).
-      2. Structural: year/month heading format validation.
-      3. LLM spot-check: first year's content for semantic fidelity.
-
-    Every attempt is saved as a candidate for best-of-N fallback.
-    """
-    english = state["english_output"]
-    korean = state["final_output"]
-    proper_nouns = state.get("proper_nouns", [])
-    retry = state.get("translation_retry_count", 0)
-
-    # --- Proper noun score (used by all layers + candidate tracking) ---
-    missing = [n for n in proper_nouns if n not in korean]
-    total = max(len(proper_nouns), 1)
-    missing_ratio = len(missing) / total
-    kept_pct = (1 - missing_ratio) * 100
-
-    # Save this attempt as a candidate regardless of outcome
-    candidate = {
-        "content": korean,
-        "missing_count": len(missing),
-        "total_nouns": len(proper_nouns),
-        "kept_pct": kept_pct,
-        "retry": retry,
-    }
-
-    # --- Layer 1: Proper noun check (reject if >50% missing) ---
-    if missing_ratio > 0.5:
-        msg = f"Too many proper nouns missing ({len(missing)}/{len(proper_nouns)}, kept {kept_pct:.0f}%): {missing[:10]}"
-        plog("translation_checker", f"REJECTED (proper nouns, {kept_pct:.0f}% kept): {len(missing)}/{len(proper_nouns)} missing")
-        return {
-            "is_translation_approved": False,
-            "translation_feedback": msg,
-            "translation_candidates": [candidate],
-        }
-
-    # --- Layer 2: Structural validation ---
-    expected_count = count_expected_periods(english)
-    struct_ok, struct_msg = validate_korean_structure(korean, expected_count)
-
-    if not struct_ok:
-        plog("translation_checker", f"REJECTED (structure, {kept_pct:.0f}% nouns kept): {struct_msg}")
-        return {
-            "is_translation_approved": False,
-            "translation_feedback": struct_msg,
-            "translation_candidates": [candidate],
-        }
-    psub("translation_checker", f"structure: {struct_msg}")
-
-    # --- Layer 3: LLM spot-check ---
-    en_sample = english[:2000]
-    kr_sample = korean[:2000]
-
-    spot_system = (
-        "You are a translation quality auditor. Compare the English source whitepaper "
-        "and the rendered Korean whitepaper below. The Korean version uses a different "
-        "heading structure (## year / ### month) which is expected and correct. Check for:\n"
-        "1. Proper nouns, dates, or numbers that were altered, transliterated, or missing\n"
-        "2. Factual information added that is not in the English source\n"
-        "3. Factual information from the English source that was omitted\n"
-        "4. Tone consistency (formal Korean ~다/~함/~구축됨 expected)\n"
-        "Report any issues. Respond in English."
-    )
-    spot_messages = [
-        {"role": "system", "content": spot_system},
-        {"role": "user", "content": (
-            f"[ENGLISH SOURCE]\n{en_sample}\n\n"
-            f"[KOREAN RENDERED]\n{kr_sample}\n\n"
-            "Verification result:"
-        )},
-    ]
-    guard_overhead = estimate_guard_overhead(TranslationCheckResult.model_json_schema())
-    spot_size = measure_messages_bytes(spot_messages) + guard_overhead
-
-    if spot_size <= effective_budget():
-        result = structured_call(
-            spot_messages, TranslationCheckResult, role="judge", temperature=0.0,
-        )
-        if not result.is_approved:
-            all_missing = list(set(missing + result.missing_terms))
-            msg = f"LLM spot-check failed: {result.feedback}. Missing: {all_missing[:10]}"
-            plog("translation_checker", f"REJECTED (LLM, {kept_pct:.0f}% nouns kept)")
-            return {
-                "is_translation_approved": False,
-                "translation_feedback": msg,
-                "translation_candidates": [candidate],
-            }
-        psub("translation_checker", f"LLM spot-check passed: {result.feedback[:60]}")
-    else:
-        psub("translation_checker", "LLM spot-check skipped (budget exceeded)")
-
-    # All checks passed
-    plog("translation_checker", f"APPROVED retry={retry} (nouns kept {kept_pct:.0f}%)")
-    return {
-        "is_translation_approved": True,
-        "translation_feedback": f"Rendering approved (nouns kept {kept_pct:.0f}%)",
-    }
-
-
-def route_translation(state: GraphState) -> str:
-    """Translation verification routing. Up to 30 retries before fallback."""
-    if state.get("is_translation_approved"):
-        return "END"
-    if state.get("translation_retry_count", 0) >= 30:
-        return "fallback_english"
-    return "retry_translate"
-
-
-def retry_translate_node(state: GraphState) -> Dict[str, Any]:
-    """Increment retry counter for translation re-attempt."""
-    retry = state.get("translation_retry_count", 0) + 1
-    plog("retry_translate", f"retrying rendering (attempt {retry}/30)")
-    return {"translation_retry_count": retry}
-
-
-def fallback_english_node(state: GraphState) -> Dict[str, Any]:
-    """All retries exhausted — return the top 3 best candidates by proper noun retention.
-
-    If no candidates exist, falls back to English original.
-    """
-    english = state["english_output"]
-    candidates = state.get("translation_candidates", [])
-    total_attempts = state.get("translation_retry_count", 0) + 1
-
-    if not candidates:
-        plog("fallback_english", "No candidates collected — English original saved separately")
-        return {
-            "final_output": (
-                "> ⚠️ **렌더링 실패** — 한국어 변환 후보 없음. "
-                "영문 원본은 _en 파일을 참조하십시오.\n"
-            )
-        }
-
-    # Sort by missing_count ascending (best = least missing nouns)
-    ranked = sorted(candidates, key=lambda c: c["missing_count"])
-    top3 = ranked[:3]
-
-    plog("fallback_english",
-         f"{total_attempts}회 시도 후 기준 미달 — 상위 {len(top3)}건 반환 "
-         f"(best {top3[0]['kept_pct']:.0f}% kept)")
-
-    parts: List[str] = []
-    parts.append(
-        f"> ⚠️ **렌더링 공지** — {total_attempts}회 시도 후 고유명사 기준 미달. "
-        f"상위 {len(top3)}건을 아래 제시합니다.\n"
-    )
-
-    for i, c in enumerate(top3, 1):
-        parts.append(
-            f"\n---\n\n"
-            f"## 후보 {i} (고유명사 유지율: {c['kept_pct']:.0f}%, "
-            f"누락 {c['missing_count']}/{c['total_nouns']}, "
-            f"attempt #{c['retry']})\n\n"
-            f"{c['content']}"
-        )
-
-    return {"final_output": "\n".join(parts)}
