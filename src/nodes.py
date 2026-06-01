@@ -214,6 +214,7 @@ def period_summarizer_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         system_content,
         PeriodSummary.model_json_schema(),
         extra_fixed=user_template.format(period=period, events_text=""),
+        budget_override=effective_budget(),
     )
     batches = split_items_for_budget(events, format_events_for_prompt, data_budget)
     plog("period_summarizer", f"{period}: budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
@@ -469,8 +470,10 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         prev = state.get("previous_draft", "")
         bad_tokens = state.get("hallucinated_tokens", [])
         feedback = state.get("draft_feedback", "")
+        # retry extras 상한: effective_budget의 20% (504 감축 연동)
+        retry_budget = max(effective_budget() // 5, 4 * 1024)
         prev, feedback, bad_tokens = trim_retry_context(
-            prev, feedback, bad_tokens, budget_bytes=20 * 1024
+            prev, feedback, bad_tokens, budget_bytes=retry_budget
         )
         extra = (
             f"\n\n[PREVIOUS REJECTED DRAFT — DO NOT repeat this]\n{prev}\n"
@@ -513,6 +516,7 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         system_content,
         SectionDraft.model_json_schema(),
         extra_fixed=user_prefix + user_suffix,
+        budget_override=effective_budget(),
     )
     batches = split_items_for_budget(events, format_events_for_prompt, data_budget)
     plog("section_writer", f"idx={idx} budget exceeded ({size/1024:.1f}KB) — {len(batches)} batches")
@@ -618,6 +622,7 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
         system_content,
         FactCheckResult.model_json_schema(),
         extra_fixed=f"Source events (ground truth):\n\n\nDraft under review:\n{draft}\n\nVerification result:",
+        budget_override=effective_budget(),
     )
     batches = split_items_for_budget(events, format_events_for_prompt, data_budget)
 

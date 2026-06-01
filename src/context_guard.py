@@ -64,15 +64,22 @@ def available_data_budget(
     schema: dict,
     extra_fixed: str = "",
     margin: float = 0.85,
+    budget_override: int = 0,
 ) -> int:
-    """Available data budget (bytes) after subtracting system prompt, schema, and guard overhead."""
+    """Available data budget (bytes) after subtracting system prompt, schema, and guard overhead.
+
+    Args:
+        budget_override: if > 0, use this instead of BUDGET_BYTES.
+                         Pass effective_budget() for 504-aware calculation.
+    """
+    base = budget_override if budget_override > 0 else BUDGET_BYTES
     overhead = (
         measure_text_bytes(system_prompt)
         + estimate_guard_overhead(schema)
         + measure_text_bytes(extra_fixed)
         + 512  # role/content JSON wrapper
     )
-    return max(int(BUDGET_BYTES * margin) - overhead, 2048)
+    return max(int(base * margin) - overhead, 2048)
 
 
 # ─── Data splitting ─────────────────────────────────────────
