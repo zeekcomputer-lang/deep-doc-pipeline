@@ -238,9 +238,10 @@ def structured_call(
     messages: list,
     response_model: Type[T],
     role: str = "default",
-    temperature: float = 0.0,
+    temperature: float = 0.1,
     max_retries: int = 3,
     stream: bool = False,
+    reasoning_effort: str = "high",
 ) -> T:
     """GPT-OSS 호환 Pydantic 강제 LLM 호출.
 
@@ -311,6 +312,7 @@ def structured_call(
                         model=model,
                         messages=work_messages,
                         temperature=temperature,
+                        reasoning_effort=reasoning_effort,
                         stream=True,
                     )
                     _chunks: list = []
@@ -324,6 +326,7 @@ def structured_call(
                         model=model,
                         messages=work_messages,
                         temperature=temperature,
+                        reasoning_effort=reasoning_effort,
                     )
                     last_raw = response.choices[0].message.content or ""
                     count_llm()
