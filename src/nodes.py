@@ -42,21 +42,30 @@ LOCAL_DATA_PATH = "./data/records.jsonl"
 def retry_on_504(fn):
     """Decorator: on Timeout504Error, re-run the entire node function.
 
-    The 504 handler in structured_call already reduced the global budget
-    before raising. Re-running the node causes its splitting logic to
-    regenerate smaller messages using effective_budget().
-    No user message content is ever truncated.
+    504 reduction is LOCAL to this node only:
+      - reset_504_state() at entry (clean slate)
+      - On 504: structured_call reduces budget, raises Timeout504Error
+      - Decorator re-runs the node with reduced effective_budget()
+      - On success OR exhaustion: reset_504_state() restores full budget
+
+    Subsequent nodes always start with the original full budget/tokens
+    to preserve maximum output quality.
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        for attempt in range(_504_MAX_STEPS):
-            try:
-                return fn(*args, **kwargs)
-            except Timeout504Error:
-                psub("504_retry",
-                     f"{fn.__name__} — node re-run ({attempt + 1}/{_504_MAX_STEPS}), "
-                     f"budget now {effective_budget() // 1024}KB")
-        return fn(*args, **kwargs)  # final attempt, let exception propagate
+        from .llm import reset_504_state
+        reset_504_state()  # clean slate for this node
+        try:
+            for attempt in range(_504_MAX_STEPS):
+                try:
+                    return fn(*args, **kwargs)
+                except Timeout504Error:
+                    psub("504_retry",
+                         f"{fn.__name__} — node re-run ({attempt + 1}/{_504_MAX_STEPS}), "
+                         f"budget now {effective_budget() // 1024}KB")
+            return fn(*args, **kwargs)  # final attempt, let exception propagate
+        finally:
+            reset_504_state()  # always restore full budget for next node
     return wrapper
 
 
