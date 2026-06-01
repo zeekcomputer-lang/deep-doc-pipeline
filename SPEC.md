@@ -9,6 +9,11 @@
 > - Fact-checker 회귀 방지: 반려 이전 초안 + 환각 토큰 블랙리스트를 재작성 시 명시적으로 주입
 > - Fail-Safe 강제통과 시 워터마크 + `unverified_sections` 상태 추가
 > - `compiler_node`를 순수 Python 조립으로 한정하고 별도 `polish_node` + 2차 fact-check 도입
+>
+> **v1.3 변경 요약 (2026-06-01, SPEC 외부 작업 — HANDOFF.md 상세):**
+> - 모든 LLM 프롬프트 영어 강제 (EN-only) + `status_report` 모드 제거 (백서 전용)
+> - Phase 5 신설: EN→KR 수석 에디터 스타일 렌더링 + 3중 검증 (Python+구조+LLM)
+> - 본 SPEC은 v1.1 설계 원본을 보존. v1.3 상세는 HANDOFF.md §1·§3·§4 참조
 
 ---
 

@@ -20,6 +20,8 @@
 | L-011 | 아키텍처 | 대용량 LLM 컨텍스트 504: Streaming + Section Chunking 이중 방어 |
 | L-012 | 아키텍처 | 95KB 하드리밋: 측정→분할→병합→교차검증 파이프라인, 손실 최소화 우선순위 4단계 |
 | L-013 | 아키텍처 | EN-only LLM + 후번역: 고유명사 추출→번역→3중검증(Python+구조+LLM) 파이프라인 |
+| L-014 | 렌더링 | 번역≠렌더링: 스타일 가이드 기반 재구성이 단순 번역보다 최종 품질 우월 |
+| L-015 | 아키텍처 | json_guard의 언어 강제는 노드별로 분리해야 다국어 출력 공존 가능 |
 
 ---
 
@@ -321,6 +323,46 @@ gh repo edit zeekcomputer-lang/<repo> --visibility private
 - 과다 추출 허용 (over-preserve > under-preserve)
 
 **적용:** `src/nodes.py` Phase 5, `src/utils.py` `extract_proper_nouns`
+
+---
+
+## L-014: 번역 ≠ 렌더링 — 스타일 가이드 기반 재구성
+
+**상황:**
+v1.3에서 단순 EN→KR 번역으로 구현했으나, 사용자가 수석 에디터 스타일 가이드를 제공.
+단순 번역은 영어 백서의 `## Section Title` / `_Target period:_` 구조를 그대로 유지하지만,
+스타일 가이드는 `## {year}년` / `### {year}년 X월: [요약]` 구조로 **재구성**을 요구함.
+
+**교훈:**
+- 번역(translation)과 렌더링(rendering)은 다른 작업. 렌더링은 구조 변환 + 톤 적용 + 언어 변환을 한 번에 수행.
+- 연도별 분할 렌더링 + `previous_context` 전달로 다년도 데이터의 서술 연속성 확보.
+- 구조 검증도 렌더링 구조에 맞춰야 함: `split_compiled_by_section` 대신 `validate_korean_structure`.
+- 예산 초과 시 section-by-section 폴백에서 `## 연도` 헤딩은 수동 삽입, `### 월` 헤딩만 LLM이 생성.
+
+**적용:** `src/nodes.py` `_build_render_prompt()`, `translate_node`, `translation_checker_node`
+
+---
+
+## L-015: json_guard 언어 강제와 다국어 출력 공존
+
+**상황:**
+v1.3에서 json_guard에 "All text content MUST be in English" 추가 →
+한국어 렌더링(`translate_node`) 시 json_guard의 영어 강제와 충돌 발생.
+
+**잘못된 설계:**
+json_guard에 언어 강제를 넣으면 **전체 파이프라인이 단일 언어에 갇힘**.
+
+**올바른 설계 (v1.3.1):**
+- json_guard는 **언어 중립** — JSON 형식/스키마만 강제, 언어 미명시
+- 영어 강제는 **노드별** `_EN_ENFORCE` 접미사로 적용 (Phase 1~4 노드)
+- 한국어 렌더링 노드(`translate_node`)는 `_EN_ENFORCE` 미사용
+- 결과: 동일 파이프라인에서 영어 출력 노드와 한국어 렌더링 노드 공존
+
+**원칙:**
+> LLM 출력 언어 강제는 글로벌(json_guard)이 아닌 노드별(system prompt)로 적용할 것.
+> 다국어 출력이 필요한 파이프라인에서는 글로벌 언어 강제가 단일 장애점이 됨.
+
+**적용:** `src/llm.py` json_guard (언어 중립), `src/nodes.py` `_EN_ENFORCE` (영어 노드용)
 
 ---
 
