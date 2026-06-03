@@ -833,102 +833,148 @@ def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────
-# Rendering System Prompt Builder
+# Phase 5: Translation Prompts and Helpers — v2.0
 # ──────────────────────────────────────────────────────────────
 
-def _build_render_prompt(
-    current_year: str,
-    previous_context: str,
-    proper_nouns: List[str],
-    retry_feedback: str = "",
-) -> str:
-    """Build the Korean whitepaper rendering system prompt for a specific year.
+# Completeness thresholds
+_KR_EN_CHAR_RATIO_MIN = 0.35   # Korean chars / English chars minimum
+_PARAGRAPH_CHUNK_MAX_BYTES = 8 * 1024  # 8KB max per paragraph chunk
 
-    Incorporates the senior editor style guide: year/month heading structure,
-    integrated narrative, inline KPI emphasis, formal tone (~다/~함/~구축됨).
+
+def _build_faithful_translate_prompt(proper_nouns: List[str]) -> str:
+    """Build translation system prompt focused on faithful completeness.
+
+    v2.0: Replaces _build_render_prompt. Emphasis shifted from "rendering"
+    (which LLMs interpret as creative rewriting/summarization) to "faithful
+    translation" (1:1 sentence correspondence, no compression).
     """
     noun_ref = "\n".join(f"  - {n}" for n in proper_nouns[:100]) if proper_nouns else "(없음)"
-
-    if previous_context:
-        prev_section = (
-            f"- 이전 시점의 핵심 흐름: {previous_context}\n"
-            " (위 흐름을 바탕으로 이번 연도의 서술을 이어가며 전체 문맥의 연속성을 확보합니다.)"
-        )
-    else:
-        prev_section = "- 첫 연도이므로 이전 맥락 없이 시작합니다."
-
-    retry_hint = ""
-    if retry_feedback:
-        retry_hint = (
-            f"\n\n[이전 렌더링 반려 사유 — 반드시 반영]\n{retry_feedback}\n"
-        )
-
     return (
-        "# Role\n"
-        "당신은 방대한 데이터를 엮어 유려하고 깊이 있는 공식 비즈니스 백서(Whitepaper)로 "
-        "완성하는 수석 에디터입니다.\n"
-        f"제공받은 [{current_year}년] 단위의 영문 초안 데이터를 한국어 마크다운 포맷의 "
-        "백서로 최종 렌더링하는 임무를 수행합니다.\n\n"
-        "# Context\n"
-        f"{prev_section}\n\n"
-        "# Formatting & Style Guidelines\n\n"
-        "1. 헤딩(Heading) 구조 및 텍스트 전개\n"
-        f" - 최상위 구분자인 연도는 ## {current_year}년으로 작성합니다.\n"
-        f" - 하위 구분자인 월은 ### {current_year}년 X월: [해당 월을 관통하는 핵심 요약 1줄] "
-        "형식으로 지정합니다.\n"
-        " - 마크다운 헤딩은 오직 ##와 ### 두 가지 수준만 사용합니다.\n"
-        " - 월별 상세 내용은 소제목 분리 없이, 주제별로 문단(Paragraph)을 나누어 "
-        "논리적인 서술형 텍스트로 전개합니다.\n\n"
-        "2. 밀도 있는 통합 서술 (Integrated Narrative) — 정보 누락 금지\n"
-        " - 제공된 초안의 모든 세부 정보, 배경 상황, 구체적 내역을 본문 텍스트에 빠짐없이 전부 포함합니다.\n"
-        " - 초안에 있는 문장/항목/수치를 요약하거나 생략하지 마십시오. "
-        "초안보다 짧아지면 안 됩니다.\n"
-        " - 다수의 구체적인 실행 내역이나 팩트를 나열해야 할 경우, 도입 문장 뒤에 "
-        "글머리 기호(-)를 연결하여 가독성 있게 정리합니다.\n\n"
-        "3. 유동적 KPI의 인라인(Inline) 강조\n"
-        " - 연/월별로 불규칙하게 나타나는 성과 지표(KPI) 및 수치 데이터는 본문 서술의 "
-        "흐름 속에 자연스럽게 포함합니다.\n"
-        " - 핵심 지표명, 수치, 주요 프로젝트명에는 굵은 글씨(Bold)를 적용하여 독자가 "
-        "시각적으로 쉽게 인지하도록 강조합니다.\n\n"
-        "4. 일관된 Tone & Manner 및 사실 기반 서술\n"
-        " - 공식 백서의 신뢰감을 부여하기 위해 객관적이고 명확한 평어체(~다, ~함, ~구축됨)를 "
-        "일관되게 적용합니다.\n"
-        " - 제공된 영문 초안에 명시된 사실, 날짜, 수치 정보만을 전적으로 활용하여 "
-        "문장을 구성합니다.\n"
-        " - 영문 초안에 없는 사실, 날짜, 수치를 절대 추가하지 않습니다.\n\n"
-        "5. 고유명사 보존\n"
-        " - 모든 고유명사(회사명, 프로젝트명, 인명, 기술 용어, 약어)는 원문 그대로 유지합니다.\n"
-        " - 음역(transliteration)이나 번역을 하지 않습니다.\n\n"
-        "6. 검증 미완료 섹션 경고 처리\n"
-        " - 영문 초안에 \"⚠️ **Unverified Section**\"으로 시작하는 경고 블록이 있으면,\n"
-        "   해당 경고를 한국어로 번역하여 그대로 유지합니다.\n"
-        "   (예: > ⚠️ **검증 미완료 섹션** — 자동 팩트체크 3회 실패. 원본 데이터 대조 필요.)\n\n"
+        "당신은 영문 백서를 한국어로 충실하게 번역하는 전문 번역가입니다.\n\n"
+        "## 핵심 원칙 (최우선: 완전성)\n"
+        "1. **완전 번역**: 원문의 모든 문장을 빠짐없이 번역합니다. "
+        "요약·생략·압축·의역 절대 금지.\n"
+        "2. **1:1 대응**: 원문 각 문장·항목·수치가 번역문에 반드시 대응되어야 합니다.\n"
+        "3. **사실 보존**: 날짜, 수치, 고유명사, 인과관계를 정확히 유지합니다.\n"
+        "4. **고유명사**: 회사명, 프로젝트명, 인명, 기술 용어, 약어는 원문 그대로 유지.\n"
+        "5. **마크다운 구조 유지**: 리스트(-), 볼드(**), 인용(>), 코드(`) 등을 보존합니다.\n"
+        "6. **톤**: 공식 백서 평어체 (~다, ~함, ~구축됨).\n"
+        "7. **KPI 강조**: 핵심 지표명, 수치, 주요 프로젝트명에는 **볼드** 적용.\n"
+        "8. **경고 블록**: \"⚠️ **Unverified Section**\" → "
+        "\"⚠️ **검증 미완료 섹션**\"으로 번역.\n\n"
         f"[보존 대상 고유명사 목록]\n{noun_ref}\n\n"
-        "# Output Instruction\n"
-        f"- 렌더링된 백서 본문은 ## {current_year}년 헤딩으로 시작합니다.\n"
-        "- 해당 연도의 마지막 데이터를 서술하는 문장으로 종료합니다.\n"
-        "- 영문 초안의 모든 정보가 한국어 본문에 반드시 포함되어야 합니다. "
-        "요약하거나 생략하지 마십시오."
-        f"{retry_hint}"
+        "## 출력\n"
+        "- 원문의 모든 문장을 한국어로 번역하여 content 필드에 담습니다.\n"
+        "- 번역문이 원문보다 짧으면 실패입니다. 원문의 모든 정보를 포함해야 합니다.\n"
     )
 
 
-@retry_on_504
+def _build_section_translate_prompt(
+    year: str, month: str, proper_nouns: List[str],
+    previous_context: str = "",
+) -> str:
+    """Build section-level translation prompt with heading generation."""
+    base = _build_faithful_translate_prompt(proper_nouns)
+    heading_instruction = (
+        f"\n## 섹션 헤딩 생성\n"
+        f"- 번역 출력의 첫 줄은 반드시 다음 형식이어야 합니다:\n"
+        f"  ### {year}년 {month}월: [해당 월을 관통하는 핵심 요약 1줄]\n"
+        f"- 이 헤딩 뒤에 빈 줄을 두고 번역된 본문을 이어갑니다.\n"
+    )
+    context_section = ""
+    if previous_context:
+        context_section = (
+            f"\n## 이전 맥락\n"
+            f"이전 섹션의 흐름: {previous_context[:300]}\n"
+            f"이 흐름을 이어받아 연속성 있게 번역합니다.\n"
+        )
+    return base + heading_instruction + context_section
+
+
+def _build_korean_gen_prompt(
+    year: str, month: str, events: List[Dict],
+    period_summary: str, proper_nouns: List[str],
+) -> str:
+    """Build prompt for direct Korean generation from source data (fallback path).
+
+    Used when translation fails: generates Korean whitepaper section directly
+    from the pipeline's extracted events and period summaries.
+    """
+    noun_ref = "\n".join(f"  - {n}" for n in proper_nouns[:50]) if proper_nouns else "(없음)"
+    events_text = format_events_for_prompt(events)
+    return (
+        f"당신은 {year}년 {month}월 데이터를 바탕으로 한국어 백서 섹션을 "
+        "작성하는 편집자입니다.\n\n"
+        "## 원본 데이터\n"
+        f"[월간 요약] {period_summary}\n\n"
+        f"[상세 이벤트]\n{events_text}\n\n"
+        "## 작성 지침\n"
+        "1. 제공된 모든 이벤트를 빠짐없이 포함하여 상세한 서술형 한국어 텍스트로 작성.\n"
+        "2. 날짜, 수치, 고유명사를 정확히 유지.\n"
+        "3. 공식 백서 평어체 (~다, ~함, ~구축됨).\n"
+        "4. 핵심 지표/수치는 **볼드**, 다수 항목은 글머리 기호(-) 정리.\n"
+        f"5. 첫 줄: ### {year}년 {month}월: [핵심 요약 1줄]\n\n"
+        f"[보존 대상 고유명사 목록]\n{noun_ref}\n"
+    )
+
+
+def _split_into_paragraph_chunks(
+    text: str, max_bytes: int = _PARAGRAPH_CHUNK_MAX_BYTES,
+) -> List[str]:
+    """Split text into chunks at paragraph boundaries, respecting byte limit."""
+    paragraphs = text.split("\n\n")
+    chunks: List[str] = []
+    current: List[str] = []
+    current_bytes = 0
+
+    for para in paragraphs:
+        para_bytes = len(para.encode("utf-8"))
+        if current and current_bytes + para_bytes + 2 > max_bytes:
+            chunks.append("\n\n".join(current))
+            current = [para]
+            current_bytes = para_bytes
+        else:
+            current.append(para)
+            current_bytes += para_bytes + 2
+
+    if current:
+        chunks.append("\n\n".join(current))
+
+    return chunks if chunks else [text]
+
+
+def _check_completeness(english: str, korean: str) -> bool:
+    """Check if Korean output preserves enough content relative to English input.
+
+    Korean text is character-dense (1 Korean char ≈ 2-3 English chars of meaning).
+    A char ratio of 0.35+ typically indicates faithful translation.
+    Below 0.35 strongly suggests summarization/truncation.
+    """
+    en_len = len(english.strip())
+    kr_len = len(korean.strip())
+    if en_len == 0:
+        return True
+    return (kr_len / en_len) >= _KR_EN_CHAR_RATIO_MIN
+
+
 @retry_on_504
 def translate_node(state: GraphState) -> Dict[str, Any]:
-    """Render English whitepaper into styled Korean whitepaper.
+    """Render English whitepaper into Korean — v2.0 paragraph-chunked faithful translation.
 
-    Strategy:
-      - If english_output <= 90KB: full-document rendering in one LLM call
-        (zero context loss, maximum quality).
-      - If > 90KB: month-by-month rendering using period_summaries and
-        global_theme from earlier pipeline stages as context.
+    Key change from v1: ALWAYS section-by-section with paragraph fallback.
+    No full-document single-call path. Prevents output token truncation.
+
+    Pipeline per section:
+      1. Try full-section faithful translation (single LLM call)
+      2. Completeness check (Korean/English char ratio ≥ 0.35)
+      3. If incomplete → split into paragraph chunks, translate each individually
+      4. If paragraphs fail → generate Korean from source pipeline data (events/summaries)
+      5. Direct concatenation (no LLM merge step — prevents compression)
     """
     english = state["english_output"]
     proper_nouns = state.get("proper_nouns", [])
-
-    english_bytes = len(english.encode("utf-8"))
-    FULL_RENDER_LIMIT = 90 * 1024  # 90KB
+    period_summaries = state.get("period_summaries", {})
+    grouped_chunks = state.get("grouped_chunks", {})
 
     doc_header, sections, audit = split_compiled_by_section(english)
     years = extract_years_from_content(english)
@@ -937,39 +983,12 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
 
     guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
 
-    # ── Path A: Full-document rendering (≤90KB) ──────────────────
-    if english_bytes <= FULL_RENDER_LIMIT:
-        system_prompt = _build_render_prompt(
-            years[0] if len(years) == 1 else f"{years[0]}~{years[-1]}",
-            "", proper_nouns,
-        )
-        full_msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"# Input Draft Text\n\n{english}"},
-        ]
-        result = structured_call(
-            full_msgs, PolishedDocument, role="writer",
-            temperature=0.2, stream=True,
-        )
-        plog("translate", f"full-document render ({english_bytes/1024:.0f}KB), len={len(result.content)}")
-
-        final = result.content
-        if audit:
-            final += "\n" + audit.replace("### Audit Log", "### 감사 로그").replace(
-                "Unverified section indices:", "검증 미완료 섹션 인덱스:")
-        return {"final_output": final}
-
-    # ── Path B: Month-by-month rendering (>90KB) ─────────────────
-    plog("translate", f"english {english_bytes/1024:.0f}KB > 90KB — month-by-month rendering")
-
-    # Retrieve earlier-stage context for richer month rendering
-    period_summaries = state.get("period_summaries", {})
-    global_theme = state.get("global_theme", "")
-
     rendered_parts: List[str] = []
+    total_en_chars = 0
+    total_kr_chars = 0
     previous_context = ""
 
-    for yi, year in enumerate(years):
+    for year in years:
         year_sections = extract_sections_for_year(sections, year)
         if not year_sections:
             continue
@@ -977,58 +996,170 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
         year_rendered: List[str] = [f"## {year}년\n"]
 
         for si, sec in enumerate(year_sections):
-            # Extract this section's target period for summary lookup
+            # ── Parse section metadata ──
             period_match = re.search(r'_Target period:\s*(\d{4}-\d{2})_', sec)
             target_period = period_match.group(1) if period_match else ""
-
-            # Build month-level context from pipeline state
-            month_summary = period_summaries.get(target_period, "")
-            context_block = ""
-            if global_theme or month_summary or previous_context:
-                parts = []
-                if global_theme and si == 0:
-                    parts.append(f"[전체 흐름] {global_theme}")
-                if month_summary:
-                    parts.append(f"[{target_period} 요약] {month_summary}")
-                if previous_context:
-                    parts.append(f"[이전 섹션 맥락] {previous_context}")
-                context_block = "\n\n" + "\n".join(parts) + "\n"
-
-            month_prompt = _build_render_prompt(
-                year, previous_context, proper_nouns,
+            month_num = (
+                str(int(target_period.split("-")[1]))
+                if target_period else "?"
             )
-            # Override heading instruction for month-level
-            month_prompt = month_prompt.replace(
-                f"렌더링된 백서 본문은 ## {year}년 헤딩으로 시작합니다.",
-                f"### {year}년 X월 헤딩으로 바로 시작합니다 "
-                f"(## {year}년 헤딩은 이미 삽입되어 있으므로 생략).",
-            )
+            title_match = re.search(r'^## (.+?)(?:\s{2})?$', sec, re.MULTILINE)
+            english_title = title_match.group(1).strip() if title_match else ""
 
+            header, body = split_section_header_body(sec)
+            if not body.strip():
+                year_rendered.append(sec)
+                continue
+
+            total_en_chars += len(body)
+            korean_body = None
+
+            # ══════════════════════════════════════════════════════
+            # Step 1: Full-section faithful translation
+            # ══════════════════════════════════════════════════════
+            section_prompt = _build_section_translate_prompt(
+                year, month_num, proper_nouns, previous_context,
+            )
             sec_msgs = [
-                {"role": "system", "content": month_prompt},
-                {"role": "user", "content": f"# Input Draft Text{context_block}\n\n{sec}"},
+                {"role": "system", "content": section_prompt},
+                {"role": "user", "content": (
+                    f"다음 영문 백서 섹션을 한국어로 완전 번역하십시오.\n\n"
+                    f"[섹션 제목] {english_title}\n"
+                    f"[대상 기간] {year}년 {month_num}월\n\n"
+                    f"---\n\n{body}"
+                )},
             ]
             sec_size = measure_messages_bytes(sec_msgs) + guard_overhead
 
             if sec_size <= effective_budget():
-                sec_result = structured_call(
-                    sec_msgs, PolishedDocument, role="writer",
-                    temperature=0.2, stream=True,
-                )
-                year_rendered.append(sec_result.content)
-                previous_context = sec_result.content[-300:]
-            else:
-                # Budget exceeded even for single section — keep English
-                year_rendered.append(sec)
-                previous_context = sec[-300:]
+                try:
+                    result = structured_call(
+                        sec_msgs, PolishedDocument, role="writer",
+                        temperature=0.2, stream=True,
+                    )
+                    if _check_completeness(body, result.content):
+                        korean_body = result.content
+                        # Ensure heading is present
+                        if not korean_body.strip().startswith("###"):
+                            heading = f"### {year}년 {month_num}월"
+                            if english_title:
+                                heading += f": {english_title}"
+                            korean_body = heading + "\n\n" + korean_body
+                        plog("translate",
+                             f"[{target_period}] full-section OK "
+                             f"(en={len(body)} kr={len(result.content)} "
+                             f"ratio={len(result.content)/max(len(body),1):.2f})")
+                    else:
+                        plog("translate",
+                             f"[{target_period}] full-section INCOMPLETE "
+                             f"(en={len(body)} kr={len(result.content)} "
+                             f"ratio={len(result.content)/max(len(body),1):.2f})"
+                             " → paragraph split")
+                except Exception as e:
+                    plog("translate",
+                         f"[{target_period}] full-section error: {e}"
+                         " → paragraph split")
 
-            plog("translate",
-                 f"year={year} month={target_period} "
-                 f"({si+1}/{len(year_sections)}) done")
+            # ══════════════════════════════════════════════════════
+            # Step 2: Paragraph-level translation (anti-truncation)
+            # ══════════════════════════════════════════════════════
+            if korean_body is None:
+                chunk_prompt = _build_faithful_translate_prompt(proper_nouns)
+                chunks = _split_into_paragraph_chunks(body)
+                kr_chunks: List[str] = []
+                chunk_failed = False
+
+                for ci, chunk in enumerate(chunks):
+                    if not chunk.strip():
+                        kr_chunks.append(chunk)
+                        continue
+                    chunk_msgs = [
+                        {"role": "system", "content": chunk_prompt},
+                        {"role": "user", "content": (
+                            "다음 영문 텍스트를 한국어로 완전 번역하십시오.\n\n"
+                            f"{chunk}"
+                        )},
+                    ]
+                    chunk_size = measure_messages_bytes(chunk_msgs) + guard_overhead
+
+                    if chunk_size <= effective_budget():
+                        try:
+                            cr = structured_call(
+                                chunk_msgs, PolishedDocument, role="writer",
+                                temperature=0.2, stream=True,
+                            )
+                            kr_chunks.append(cr.content)
+                        except Exception as e:
+                            plog("translate",
+                                 f"[{target_period}] chunk {ci+1}/{len(chunks)}"
+                                 f" error: {e}")
+                            chunk_failed = True
+                            break
+                    else:
+                        plog("translate",
+                             f"[{target_period}] chunk {ci+1}/{len(chunks)}"
+                             " exceeds budget")
+                        chunk_failed = True
+                        break
+
+                if not chunk_failed and kr_chunks:
+                    # Generate heading for paragraph-split path
+                    heading_line = f"### {year}년 {month_num}월"
+                    if english_title:
+                        heading_line += f": {english_title}"
+                    korean_body = heading_line + "\n\n" + "\n\n".join(kr_chunks)
+                    plog("translate",
+                         f"[{target_period}] paragraph-split done "
+                         f"({len(chunks)} chunks → "
+                         f"en={len(body)} kr={len(korean_body)})")
+
+            # ══════════════════════════════════════════════════════
+            # Step 3: Fallback — Korean from source pipeline data
+            # ══════════════════════════════════════════════════════
+            if korean_body is None:
+                events = grouped_chunks.get(target_period, [])
+                summary = period_summaries.get(target_period, "")
+
+                if events:
+                    gen_prompt = _build_korean_gen_prompt(
+                        year, month_num, events, summary, proper_nouns,
+                    )
+                    gen_msgs = [
+                        {"role": "system", "content": gen_prompt},
+                        {"role": "user", "content": (
+                            "위 데이터를 바탕으로 상세한 한국어 백서 섹션을 작성하십시오."
+                        )},
+                    ]
+                    try:
+                        gr = structured_call(
+                            gen_msgs, PolishedDocument, role="writer",
+                            temperature=0.3,
+                        )
+                        korean_body = gr.content
+                        plog("translate",
+                             f"[{target_period}] FALLBACK: Korean from source "
+                             f"(events={len(events)} kr={len(korean_body)})")
+                    except Exception as e:
+                        plog("translate",
+                             f"[{target_period}] fallback error: {e} — keeping English")
+                        korean_body = (
+                            f"### {year}년 {month_num}월: {english_title}\n\n{body}"
+                        )
+                else:
+                    plog("translate",
+                         f"[{target_period}] no source data — keeping English")
+                    korean_body = (
+                        f"### {year}년 {month_num}월: {english_title}\n\n{body}"
+                    )
+
+            total_kr_chars += len(korean_body)
+            previous_context = korean_body[-500:] if korean_body else ""
+
+            year_rendered.append(korean_body)
 
         rendered_parts.append("\n\n".join(year_rendered))
 
-    # Audit log (deterministic)
+    # ── Audit log (deterministic) ──
     kr_audit = ""
     if audit:
         kr_audit = (
@@ -1041,5 +1172,10 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
     if kr_audit:
         final += "\n" + kr_audit
 
-    plog("translate", f"month-by-month done: years={years} len={len(final)}")
+    overall_ratio = total_kr_chars / max(total_en_chars, 1)
+    plog("translate",
+         f"v2.0 complete: years={years} "
+         f"en_chars={total_en_chars} kr_chars={total_kr_chars} "
+         f"ratio={overall_ratio:.2f}")
+
     return {"final_output": final}
