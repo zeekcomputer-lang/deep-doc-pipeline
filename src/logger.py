@@ -15,6 +15,8 @@ Usage:
 """
 from __future__ import annotations
 import time
+import traceback
+from datetime import datetime
 from threading import Lock
 
 _start: float = 0.0
@@ -76,3 +78,38 @@ def summary() -> dict:
         "nodes": _node_count,
         "llm_calls": _llm_count,
     }
+
+
+_LOG_FILE = "pipeline_error.log"
+
+
+def log_error(
+    node_name: str,
+    error: Exception,
+    stack_trace: str = "",
+) -> None:
+    """Append a node-level failure record to pipeline_error.log (append mode).
+
+    Args:
+        node_name:   Name of the failing node or call site.
+        error:       The exception that was raised.
+        stack_trace: Pre-formatted traceback string.
+                     If omitted, uses traceback.format_exc().
+    """
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    error_type = type(error).__name__
+    error_msg = str(error)
+    tb_str = stack_trace if stack_trace else traceback.format_exc()
+
+    entry = (
+        f"[{timestamp}] node={node_name} error_type={error_type}\n"
+        f"message: {error_msg}\n"
+        f"traceback:\n{tb_str}"
+        f"{'\u2500' * 60}\n"
+    )
+
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except OSError as oe:
+        print(f"[WARN] {_LOG_FILE} 기록 실패: {oe}")

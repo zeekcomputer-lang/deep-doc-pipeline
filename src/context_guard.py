@@ -42,14 +42,6 @@ def measure_text_bytes(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
-def fits_budget(messages: list, budget: int = 0) -> Tuple[bool, int]:
-    """Check if messages fit budget. Returns (fits, actual_bytes)."""
-    if budget <= 0:
-        budget = BUDGET_BYTES
-    size = measure_messages_bytes(messages)
-    return size <= budget, size
-
-
 # ─── Budget calculation ────────────────────────────────────
 
 def estimate_guard_overhead(schema: dict) -> int:

@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from .context_guard import (
     BUDGET_BYTES, measure_messages_bytes, ContextBudgetExceeded,
 )
-from .logger import psub, count_llm, get_llm_count
+from .logger import psub, count_llm, get_llm_count, log_error
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -459,6 +459,7 @@ def structured_call(
 
             # ── All retries exhausted ──
             last_err = e
+            log_error("structured_call", e)
             break
 
     raise RuntimeError(

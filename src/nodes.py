@@ -868,7 +868,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════
-# Phase 5: Translation / Rendering (English → Korean)
+# Phase 5: Translation (English → Korean)
 # ══════════════════════════════════════════════════════════════
 
 def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
@@ -1014,7 +1014,7 @@ def _check_completeness(english: str, korean: str) -> bool:
 
 @retry_on_504
 def translate_node(state: GraphState) -> Dict[str, Any]:
-    """Render English whitepaper into Korean — v2.0 paragraph-chunked faithful translation.
+    """Translate English whitepaper into Korean — v2.0 paragraph-chunked faithful translation.
 
     Key change from v1: ALWAYS section-by-section with paragraph fallback.
     No full-document single-call path. Prevents output token truncation.

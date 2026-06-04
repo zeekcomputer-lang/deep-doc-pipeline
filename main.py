@@ -25,7 +25,7 @@ except ImportError:
 
 from src.graph import build_graph
 from src.nodes import LOCAL_DATA_PATH, set_skip_fact_check
-from src.logger import reset_stats, summary
+from src.logger import reset_stats, summary, log_error
 from src.llm import reset_504_state, set_default_reasoning
 
 
@@ -78,7 +78,13 @@ def main():
     }
 
     # recursion_limit를 충분히 늘려 루프 동작 보장
-    final_state = graph.invoke(initial_state, config={"recursion_limit": 200})
+    import traceback as _tb
+    try:
+        final_state = graph.invoke(initial_state, config={"recursion_limit": 200})
+    except Exception as _e:
+        log_error("graph.invoke", _e, _tb.format_exc())
+        print(f"\n[ERROR] 파이프라인 실행 실패: {_e}")
+        sys.exit(1)
 
     final = final_state.get("final_output", "(빈 결과)")
     english = final_state.get("english_output", "")
@@ -118,7 +124,7 @@ def main():
     print(f"  고유명사 추출 : {len(nouns)}개")
     if english:
         print(f"  영문 원본    : {len(english):,} chars → {en_path.resolve()}")
-    print(f"  한글 렌더링  : {len(final):,} chars → {out_path.resolve()}")
+    print(f"  한글 번역    : {len(final):,} chars → {out_path.resolve()}")
     print("=" * 70)
 
 
