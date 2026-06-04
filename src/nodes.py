@@ -38,6 +38,27 @@ import functools
 
 LOCAL_DATA_PATH = "./data/records.jsonl"
 
+# ════════════════════════════════════════════════════════════════
+# Fact-check skip mode (--skip-fact-check)
+# ════════════════════════════════════════════════════════════════
+# 활성화 시:
+#   - fact_checker_node: LLM 호출 생략, 자동 승인
+#   - planner_critique_node: LLM 비평 생략 (Python 검증은 유지)
+#   - 집필 루프가 1회로 줄어 속도 대폭 향상
+#   - ⚠️ 환각/사실오류가 미검증 상태로 최종 문서에 포함될 수 있음
+
+_skip_fact_check: bool = False
+
+
+def set_skip_fact_check(skip: bool) -> None:
+    """main.py에서 호출. --skip-fact-check 플래그 설정."""
+    global _skip_fact_check
+    _skip_fact_check = skip
+
+
+def get_skip_fact_check() -> bool:
+    return _skip_fact_check
+
 # ══════════════════════════════════════════════════════════════
 # 504 retry decorator: re-runs the entire node with reduced budget
 # ══════════════════════════════════════════════════════════════
@@ -387,6 +408,16 @@ def planner_critique_node(state: GraphState) -> Dict[str, Any]:
             "outline_retry_count": state.get("outline_retry_count", 0) + 1,
         }
 
+    # ── 팩트체크 생략 모드: Python 검증 통과 시 LLM 비평 없이 자동 승인 ──
+    if _skip_fact_check:
+        retry = state.get("outline_retry_count", 0)
+        plog("planner_critique", "LLM critique SKIPPED (--skip-fact-check), auto-approved")
+        return {
+            "is_outline_approved": True,
+            "outline_feedback": "LLM critique skipped (--skip-fact-check)",
+            "outline_retry_count": retry,
+        }
+
     # LLM review: structural reasonableness
     system_content = (
         "You are a strict planning reviewer. Evaluate whether the given outline forms "
@@ -590,6 +621,15 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
           Budget-aware batch splitting + cross_check_terms.
     v1.3: English output enforced.
     """
+    # ── 팩트체크 생략 모드: LLM 호출 없이 자동 승인 ──
+    if _skip_fact_check:
+        idx = state["current_section_index"]
+        plog("fact_checker", f"idx={idx} SKIPPED (--skip-fact-check)")
+        return {
+            "is_draft_approved": True,
+            "draft_feedback": "Fact-check skipped (--skip-fact-check)",
+            "hallucinated_tokens": [],
+        }
     outline = state["outline"]
     idx = state["current_section_index"]
     item = outline[idx]

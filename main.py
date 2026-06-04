@@ -24,7 +24,7 @@ except ImportError:
     pass
 
 from src.graph import build_graph
-from src.nodes import LOCAL_DATA_PATH
+from src.nodes import LOCAL_DATA_PATH, set_skip_fact_check
 from src.logger import reset_stats, summary
 from src.llm import reset_504_state, set_default_reasoning
 
@@ -35,6 +35,8 @@ def parse_args():
     p.add_argument("--output-en", default=None, help="영문 원본 저장 경로 (기본: output 경로에 _en 붙임)")
     p.add_argument("--reasoning", choices=["high", "medium"], default="high",
                    help="LLM 추론 강도 (high: 기본, medium: 빠른 응답/낮은 품질)")
+    p.add_argument("--skip-fact-check", action="store_true",
+                   help="팩트체크/환각 검증 생략 (빠른 실행, 품질 검증 미수행)")
     return p.parse_args()
 
 
@@ -51,13 +53,15 @@ def main():
     print("Deep Doc Pipeline v2.0 — Whitepaper Generator (EN→KR)")
     print(f"모델: {os.getenv('OPENAI_MODEL', 'gpt-oss:20b')} @ "
           f"{os.getenv('OPENAI_BASE_URL', 'http://localhost:11434/v1')}")
-    print(f"추론: {args.reasoning} | 504 2회 초과 시 medium 자동 전환")
+    skip_fc = "⚠️ 팩트체크 생략" if args.skip_fact_check else "팩트체크 ON"
+    print(f"추론: {args.reasoning} | {skip_fc} | 504 2회 초과 시 medium 자동 전환")
     print("=" * 70)
 
     # 타이머 + 카운터 + 504 상태 + 추론 강도 초기화
     reset_stats()
     reset_504_state()
     set_default_reasoning(args.reasoning)
+    set_skip_fact_check(args.skip_fact_check)
 
     graph = build_graph()
 
