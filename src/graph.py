@@ -89,3 +89,47 @@ def build_graph():
     g.add_edge("translate", END)
 
     return g.compile()
+
+
+def build_resume_graph(resume_from: str):
+    """Resume graph — 특정 Phase부터 재실행.
+
+    resume_from:
+        "translate" — Phase 5만 (english_output 필요)
+        "polish"    — Phase 4b(polish) + Phase 5 (final_compiled 필요)
+        "compile"   — Phase 4b(compile+polish) + Phase 5 (completed_sections + outline 필요)
+    """
+    g = StateGraph(GraphState)
+
+    if resume_from == "translate":
+        g.add_node("prepare_translation", N.prepare_translation_node)
+        g.add_node("translate", N.translate_node)
+        g.add_edge(START, "prepare_translation")
+        g.add_edge("prepare_translation", "translate")
+        g.add_edge("translate", END)
+
+    elif resume_from == "polish":
+        g.add_node("polish", N.polish_node)
+        g.add_node("prepare_translation", N.prepare_translation_node)
+        g.add_node("translate", N.translate_node)
+        g.add_edge(START, "polish")
+        g.add_edge("polish", "prepare_translation")
+        g.add_edge("prepare_translation", "translate")
+        g.add_edge("translate", END)
+
+    elif resume_from == "compile":
+        g.add_node("compiler", N.compiler_node)
+        g.add_node("polish", N.polish_node)
+        g.add_node("prepare_translation", N.prepare_translation_node)
+        g.add_node("translate", N.translate_node)
+        g.add_edge(START, "compiler")
+        g.add_edge("compiler", "polish")
+        g.add_edge("polish", "prepare_translation")
+        g.add_edge("prepare_translation", "translate")
+        g.add_edge("translate", END)
+
+    else:
+        raise ValueError(f"Unknown resume_from: {resume_from!r}. "
+                         f"Use: translate / polish / compile")
+
+    return g.compile()

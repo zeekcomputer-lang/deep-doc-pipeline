@@ -33,6 +33,7 @@ from .prompt_config import (
     get_summary_context, get_planning_context,
     get_writing_context, get_translation_context,
 )
+from .artifacts import save_json, save_text
 import functools
 
 
@@ -185,6 +186,8 @@ def chrono_sorter_node(state: GraphState) -> Dict[str, Any]:
     """Pure Python sort + monthly grouping."""
     grouped = chrono_sort_and_group(state["extracted_events"])
     plog("chrono_sorter", f"events={len(state['extracted_events'])} months={list(grouped.keys())}")
+    save_json("phase1_extracted_events.json", state["extracted_events"])
+    save_json("phase1_grouped_chunks.json", grouped)
     return {"grouped_chunks": grouped}
 
 
@@ -311,6 +314,8 @@ def theme_analyzer_node(state: GraphState) -> Dict[str, Any]:
 
     result = structured_call(messages, GlobalTheme, role="default", temperature=0.3)
     plog("theme_analyzer", f"theme: {result.theme[:80]}...")
+    save_json("phase2_period_summaries.json", state["period_summaries"])
+    save_text("phase2_global_theme.txt", result.theme)
     return {"global_theme": result.theme}
 
 
@@ -370,6 +375,7 @@ def draft_planner_node(state: GraphState) -> Dict[str, Any]:
     result = structured_call(messages, Outline, role="default", temperature=0.3)
     items = [it.model_dump() for it in result.items]
     plog("draft_planner", f"outline items={len(items)}")
+    save_json("phase3_outline.json", items)
     return {"outline": items}
 
 
@@ -744,6 +750,7 @@ def save_section_node(state: GraphState) -> Dict[str, Any]:
     idx = state["current_section_index"]
     draft = state["current_draft"]
     plog("save_section", f"idx={idx} APPROVED")
+    save_text(f"phase4_sections/section_{idx:02d}.md", draft)
     return {
         "completed_sections": {idx: draft},
         "current_section_index": idx + 1,
@@ -763,6 +770,7 @@ def save_section_with_warning_node(state: GraphState) -> Dict[str, Any]:
         f"{draft}"
     )
     plog("save_section_with_warning", f"idx={idx} FORCE-PASS")
+    save_text(f"phase4_sections/section_{idx:02d}.md", warned)
     return {
         "completed_sections": {idx: warned},
         "unverified_sections": [idx],
@@ -789,6 +797,7 @@ def compiler_node(state: GraphState) -> Dict[str, Any]:
     unverified = state.get("unverified_sections", [])
     compiled = compile_sections(outline, completed, unverified)
     plog("compiler", f"sections={len(completed)} unverified={unverified} len={len(compiled)}")
+    save_text("phase4_compiled_en.md", compiled)
     return {"final_compiled": compiled}
 
 
@@ -864,6 +873,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
 
     final = doc_header + "".join(polished_sections) + audit
     plog("polish", f"done: sections={len(sections)} total_len={len(final)}")
+    save_text("phase4_polished_en.md", final)
     return {"final_output": final}
 
 
@@ -878,10 +888,11 @@ def prepare_translation_node(state: GraphState) -> Dict[str, Any]:
     plog("prepare_translation", f"English output saved ({len(english)} chars), extracted {len(nouns)} proper nouns")
     if nouns:
         psub("prepare_translation", f"sample nouns: {nouns[:10]}")
+    save_text("phase5_output_en.md", english)
+    save_json("phase5_proper_nouns.json", nouns)
     return {
         "english_output": english,
         "proper_nouns": nouns,
-
     }
 
 
@@ -1233,4 +1244,5 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
          f"en_chars={total_en_chars} kr_chars={total_kr_chars} "
          f"ratio={overall_ratio:.2f}")
 
+    save_text("phase5_output_kr.md", final)
     return {"final_output": final}

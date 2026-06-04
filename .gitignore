@@ -22,6 +22,7 @@ env/
 
 # Output
 output.md
+output/
 *.log
 
 # Data (생성된 더미 데이터는 커밋, 실제 운영 데이터는 제외하고 싶다면 아래 주석 해제)
