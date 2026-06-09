@@ -1,5 +1,5 @@
 """
-LangGraph global state.
+LangGraph global state — v3.0.
 """
 from __future__ import annotations
 import operator
@@ -7,43 +7,35 @@ from typing import TypedDict, List, Dict, Annotated, Any
 
 
 def update_dict(a: Dict, b: Dict) -> Dict:
-    """Dict reducer — corrected from original spec's {a, b} typo."""
     return {**a, **b}
 
 
 class GraphState(TypedDict, total=False):
-    # [1. Initial Input]
+    # Phase 1: Data Ingestion
     raw_docs: List[Dict[str, Any]]
-
-    # [2. Map-Reduce (Extraction)]
     extracted_events: Annotated[List[Dict], operator.add]
-
-    # [3. Hierarchical Data Compression]
     grouped_chunks: Dict[str, List[Dict]]
-    period_summaries: Annotated[Dict[str, str], update_dict]
-    global_theme: str
-
-    # [4. Whitepaper Planning Loop]
-    outline: List[Dict]
-    outline_feedback: str
-    is_outline_approved: bool
-    outline_retry_count: int
-
-    # [5. Section Writing and Fact-check Loop]
+    
+    # Phase 2: Compression
+    period_digests: Annotated[Dict[str, str], update_dict]
+    
+    # Phase 3: Strategic Analysis
+    blueprint: Dict
+    
+    # Phase 4: Writing Loop
     current_section_index: int
     current_draft: str
-    previous_draft: str                             # v1.1: regression guard
-    hallucinated_tokens: Annotated[List[str], operator.add]  # v1.1: banned tokens
+    previous_draft: str
+    hallucinated_tokens: Annotated[List[str], operator.add]
     draft_feedback: str
     is_draft_approved: bool
     section_retry_count: int
     completed_sections: Annotated[Dict[int, str], update_dict]
-    unverified_sections: Annotated[List[int], operator.add]  # v1.1: audit log
-
-    # [6. Final Assembly (English)]
+    
+    # Phase 5: Assembly + Polish + Translate
     final_compiled: str
-    final_output: str
-
-    # [7. Translation (English → Korean)]
     english_output: str
-    proper_nouns: List[str]
+    final_output: str
+    
+    # Phase 6: DOCX
+    docx_path: str

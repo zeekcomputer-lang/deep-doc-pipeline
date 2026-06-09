@@ -91,6 +91,15 @@ CUSTOM_DIRECTIVES: str = ""
 
 
 # ════════════════════════════════════════════════════════════════
+# v3 Document Settings
+# ════════════════════════════════════════════════════════════════
+DOCUMENT_TITLE: str = ""           # Cover title (empty = LLM generates from theme)
+DOCUMENT_SUBTITLE: str = ""        # Subtitle (empty = auto date range)
+ORGANIZATION_NAME: str = ""        # Author organization
+TARGET_WORDS_PER_SECTION: int = 400  # Target ~1 page Korean per section
+
+
+# ════════════════════════════════════════════════════════════════
 # 내부 헬퍼 — 아래 함수들은 수정하지 마십시오.
 # ════════════════════════════════════════════════════════════════
 
@@ -176,6 +185,25 @@ def get_writing_context() -> str:
         include_audience=True, include_custom=True,
         language="en",
     )
+
+
+def get_strategic_context() -> str:
+    """전략 분석 단계용 (strategic_analyst). PURPOSE + AUDIENCE."""
+    return _build_context_block(
+        include_purpose=True, include_tone=False,
+        include_audience=True, include_custom=False,
+        language="en",
+    )
+
+
+def get_docx_meta() -> dict:
+    """DOCX 빌더에 전달할 메타데이터."""
+    return {
+        "title": DOCUMENT_TITLE,
+        "subtitle": DOCUMENT_SUBTITLE,
+        "organization": ORGANIZATION_NAME,
+        "target_words": TARGET_WORDS_PER_SECTION,
+    }
 
 
 def get_translation_context() -> str:
