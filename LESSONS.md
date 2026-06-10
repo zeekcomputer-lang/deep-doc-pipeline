@@ -17,6 +17,9 @@
 | L-018 | 원칙 | user 메시지는 절대 절단하지 않는다. 노드 재실행으로 분할 로직이 더 작은 청크 생성 |
 | L-019 | 워크플로 | 검증 루프는 비용 대비 가치를 평가하라. 핵심 검증(fact_checker)만 유지, 비교 검증은 제거 |
 | L-020 | 번역 | 번역 단계 콘텐츠 소실: 출력 토큰 한계 + "렌더링" 프롬프트 → 섹션별 문단 분할 번역으로 해결 |
+| L-021 | 아키텍처 | v3.0 구조 전환: 월별 N섹션→테마 2섹션 고정으로 LLM 호출 60-80% 절감, 복잡도 대폭 감소 |
+| L-022 | 아키텍처 | 기획 루프 제거: strategic_analyst 단일 노드가 theme+planner+critique 3노드 루프를 대체 |
+| L-023 | DOCX | python-docx 직접 DOCX 생성: md→docx 2단계 변환보다 노드 내 직접 빌드가 일관성·제어력 우수 |
 
 ---
 
@@ -289,6 +292,77 @@ v1.5 translate_node에서 영문 20,000단어 → 한글 6,000단어로 소실 (
 > 출력 토큰 한계는 큰 문서의 단일 호출 번역을 반드시 무너트린다.
 
 **적용:** `src/nodes.py` Phase 5 v2.0 (Δ1 함수 제거, 5 함수 신규, translate_node 전면 재작성)
+
+---
+
+---
+
+## L-021: v3.0 구조 전환 — 월별 N섹션 → 테마 기반 2섹션 고정
+
+**상황:**
+v2.0은 월별 N개 섹션을 동적 생성. 200건 데이터에서 월 수에 비례하여 LLM 호출이 증가
+(section_writer N회 + fact_checker N회 + polish N회 + translate N회 = ~60-160회).
+
+**v3.0 결정:**
+- 테마 기반 2개 내러티브 섹션으로 고정
+- `strategic_analyst`가 전체 다이제스트를 횡단 분석하여 2개 테마 선정
+- 각 섹션의 `evidence_periods`가 복수 월을 참조 (cross-month narrative)
+- 결과: section_writer 2회 + fact_checker 2회 + polish 1회 + translate 1회 = ~20-30회
+
+**트레이드오프:**
+- 장점: LLM 호출 60-80% 절감, 파이프라인 단순화, DOCX 페이지 구조 고정
+- 단점: 월별 세부 사항 손실 가능 (다이제스트 압축 의존), 섹션 수 유연성 상실
+- 판단: 3-page 백서 목적에 적합. 상세 보고서 필요 시 v2.0 구조 복원 가능.
+
+**원칙:**
+> 출력 구조가 고정 가능하면 고정하라. 동적 구조는 LLM 호출 수를 입력 크기에 비례시켜 비용/시간을 예측 불가로 만든다.
+
+**적용:** v3.0 전체 아키텍처
+
+---
+
+## L-022: 기획 루프 제거 — strategic_analyst 단일 노드
+
+**상황:**
+v2.0의 기획 단계: `draft_planner` → `planner_critique` (최대 3회 루프).
+planner_critique는 (1) Python 기간 검증 + (2) LLM 구조 평가를 수행.
+루프 1회에 LLM 2회 소비. 실측에서 대부분 1회 만에 통과.
+
+**v3.0 결정:**
+- `strategic_analyst` 단일 노드로 통합. `DocumentBlueprint` 1회 생성.
+- 기간 검증은 프롬프트에 `available periods` 목록을 명시하여 사전 차단.
+- 구조 평가는 제거 (2섹션 고정 구조에서 불필요).
+
+**원칙:**
+> 루프를 추가하기 전에 "실측 통과율"을 확인하라. 90%+ 1회 통과면 루프 자체가 과잉 설계.
+> 프롬프트 제약으로 해결 가능한 검증은 별도 노드를 만들지 마라.
+
+**적용:** `src/nodes.py` `strategic_analyst_node`, `src/schemas.py` `DocumentBlueprint`
+
+---
+
+## L-023: python-docx 직접 DOCX 생성
+
+**상황:**
+v1.5~v2.0에서 `scripts/md_to_docx.py`로 마크다운 → DOCX 2단계 변환.
+표지 디자인, 네이비 헤딩, 악센트 라인, 페이지별 헤더/푸터 등 정밀 제어 불가.
+
+**v3.0 결정:**
+- `DocxBuilder` 클래스가 파이프라인 내부에서 직접 DOCX 생성.
+- python-docx + lxml OPC 직접 조작 (XML namespace helper).
+- 마크다운 파서 내장 (`_render_markdown`): ##/###, -/*, **bold**, `code` 지원.
+- 표지 별도 섹션 (titlePg로 헤더/푸터 미표시).
+
+**주의사항:**
+- python-docx의 built-in 스타일(Heading 1 등)은 사용하지 않음. 직접 Run 속성 설정.
+- East Asian 폰트 설정은 `w:rFonts` XML 직접 조작 필수 (python-docx API 미지원).
+- 페이지 번호 필드는 `w:fldChar` + `w:instrText` 직접 삽입.
+
+**원칙:**
+> 문서 포맷 정밀 제어가 필요하면 중간 포맷(마크다운) 없이 최종 포맷을 직접 생성하라.
+> 2단계 변환은 각 단계에서 정보 손실이 발생한다.
+
+**적용:** `src/docx_builder.py` (435줄)
 
 ---
 
