@@ -1,4 +1,4 @@
-"""LangGraph graph assembly — v3.0."""
+"""LangGraph graph assembly — v3.1."""
 from __future__ import annotations
 from langgraph.graph import StateGraph, START, END
 from .state import GraphState
@@ -59,12 +59,17 @@ def build_graph():
         {"section_writer": "section_writer", "assembler": "assembler"},
     )
 
-    # Phase 5: Assembly + Polish + Translate
+    # Phase 4b: Assembly + Implications
     g.add_node("assembler", N.assembler_node)
+    g.add_node("implications_writer", N.implications_writer_node)
+
+    g.add_edge("assembler", "implications_writer")
+
+    # Phase 5: Polish + Translate
     g.add_node("polish", N.polish_node)
     g.add_node("translate", N.translate_node)
 
-    g.add_edge("assembler", "polish")
+    g.add_edge("implications_writer", "polish")
     g.add_edge("polish", "translate")
 
     # Phase 6: DOCX

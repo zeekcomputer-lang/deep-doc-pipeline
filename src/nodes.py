@@ -1,13 +1,19 @@
 """
-LangGraph node functions — v3.0.
+LangGraph node functions — v3.1.
 One Node = One Task principle strictly enforced.
 
-v3 graph flow:
+v3.1 graph flow:
   START → load_docs → [fanout] extract(×N) → chrono_sorter
        → [fanout] period_digest(×M) → strategic_analyst
        → init_writing → section_writer → fact_checker → route(retry/save/next)
-       → assembler → polish → translate
+       → assembler → implications_writer → polish → translate
        → docx_builder → END
+
+v3.1 changes (vs v3.0):
+  - implications_writer_node: 시사점 섹션 자동 생성
+  - domain knowledge injection: 전 LLM 노드에 사전 지식 주입
+  - translate: 제목/부제 한글 번역 포함
+  - docx_builder: 본문 연속 흐름 + 시사점 섹션 + 한글 제목
 """
 from __future__ import annotations
 import json
@@ -37,6 +43,7 @@ from .context_guard import (
 from .prompt_config import (
     get_summary_context, get_strategic_context,
     get_writing_context, get_translation_context, get_docx_meta,
+    get_domain_context, get_implications_context,
 )
 from .artifacts import save_json, save_text
 import functools
@@ -47,11 +54,6 @@ LOCAL_DATA_PATH = "./data/records.jsonl"
 # ════════════════════════════════════════════════════════════════
 # Fact-check skip mode (--skip-fact-check)
 # ════════════════════════════════════════════════════════════════
-# 활성화 시:
-#   - fact_checker_node: LLM 호출 생략, 자동 승인
-#   - 집필 루프가 1회로 줄어 속도 대폭 향상
-#   - ⚠️ 환각/사실오류가 미검증 상태로 최종 문서에 포함될 수 있음
-
 _skip_fact_check: bool = False
 
 
@@ -65,7 +67,7 @@ def get_skip_fact_check() -> bool:
     return _skip_fact_check
 
 # ══════════════════════════════════════════════════════════════
-# 504 retry decorator: re-runs the entire node with reduced budget
+# 504 retry decorator
 # ══════════════════════════════════════════════════════════════
 
 def retry_on_504(fn):
@@ -76,14 +78,11 @@ def retry_on_504(fn):
       - On 504: structured_call reduces budget, raises Timeout504Error
       - Decorator re-runs the node with reduced effective_budget()
       - On success OR exhaustion: reset_504_state() restores full budget
-
-    Subsequent nodes always start with the original full budget/tokens
-    to preserve maximum output quality.
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         from .llm import reset_504_state
-        reset_504_state()  # clean slate for this node
+        reset_504_state()
         try:
             for attempt in range(_504_MAX_STEPS):
                 try:
@@ -92,14 +91,14 @@ def retry_on_504(fn):
                     psub("504_retry",
                          f"{fn.__name__} — node re-run ({attempt + 1}/{_504_MAX_STEPS}), "
                          f"budget now {effective_budget() // 1024}KB")
-            return fn(*args, **kwargs)  # final attempt, let exception propagate
+            return fn(*args, **kwargs)
         finally:
-            reset_504_state()  # always restore full budget for next node
+            reset_504_state()
     return wrapper
 
 
 # ══════════════════════════════════════════════════════════════
-# Common English enforcement suffix appended to key system prompts
+# English enforcement suffix
 # ══════════════════════════════════════════════════════════════
 _EN_ENFORCE = (
     " Respond in English only. "
@@ -142,7 +141,7 @@ def fanout_to_extractor(state: GraphState):
 def strict_extractor_node(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Extract ExtractedEvent from a single document.
 
-    95KB 초과 시 문서 자동 절단. 영어 출력 강제. 3회 retry 내장.
+    95KB 초과 시 문서 자동 절단. 영어 출력 강제. 도메인 지식 주입.
     """
     doc = payload["doc"]
     idx = payload["doc_index"]
@@ -152,6 +151,7 @@ def strict_extractor_node(payload: Dict[str, Any]) -> Dict[str, Any]:
         "You are a document analyst. Extract key facts from the given source document. "
         "The date field MUST be in YYYY-MM-DD format. "
         "NEVER fabricate information not explicitly stated in the source."
+        + get_domain_context()
         + _EN_ENFORCE
     )
     user_prefix = "Source document:\n"
@@ -211,6 +211,7 @@ def period_digest_node(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Produce a 1-2 sentence digest + event count + key metrics for a period.
 
     Budget management: if events exceed budget, batch split → sub-digests → merge.
+    도메인 지식은 get_summary_context() 경유 자동 주입.
     """
     period = payload["period"]
     events = payload["events"]
@@ -305,15 +306,14 @@ def period_digest_node(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 3: Strategic Analysis (core v3 innovation)
+# Phase 3: Strategic Analysis
 # ──────────────────────────────────────────────────────────────
 @retry_on_504
 def strategic_analyst_node(state: GraphState) -> Dict[str, Any]:
-    """Create a document blueprint with 2 narrative-based sections.
+    """Create a document blueprint with 2 narrative sections + implications.
 
     Replaces theme_analyzer + draft_planner from v2.
-    Input: period_digests (all months), grouped_chunks keys (available periods)
-    Output: blueprint (DocumentBlueprint as dict)
+    도메인 지식은 get_strategic_context() 경유 자동 주입.
     """
     digests = state["period_digests"]
     sorted_periods = sorted(digests.keys())
@@ -323,21 +323,24 @@ def strategic_analyst_node(state: GraphState) -> Dict[str, Any]:
 
     date_range = f"{sorted_periods[0]} to {sorted_periods[-1]}"
     available_periods = ", ".join(sorted_periods)
-    # Approx target words per section (~1 printed page)
     target_words = 400
 
     system_content = (
         f"You are a strategic business analyst. Given monthly digests spanning {date_range}, "
-        "create a document blueprint for a concise 3-page whitepaper (1 cover + 2 body pages).\n\n"
+        "create a document blueprint for a concise business whitepaper.\n\n"
+        "STRUCTURE: Cover (1p) + Body (2 narrative sections, ~1p each) + Implications (시사점)\n\n"
         "CRITICAL CONSTRAINTS:\n"
         "- Identify exactly 2 key narratives that provide the most business insight\n"
         "- Narratives are THEMATIC, not chronological — each can span multiple months\n"
-        f"- Each narrative will become one body page (~{target_words} words)\n"
+        f"- Each narrative will become one body section (~{target_words} words)\n"
         "- evidence_periods: list YYYY-MM keys that support each narrative "
         f"(from available: {available_periods})\n"
         "- key_points: 3-5 specific facts/metrics from the digests that MUST appear\n"
         "- doc_title: compelling title capturing the overarching theme\n"
-        "- doc_subtitle: include the data period range\n\n"
+        "- doc_subtitle: include the data period range\n"
+        "- implications_points: 3-5 strategic implications or forward-looking insights "
+        "derived from the data (these will be expanded into the final Implications section)\n\n"
+        "DO NOT include chronological timelines or month-by-month breakdowns.\n"
         f"Available period keys: {sorted_periods}\n"
         "ONLY use periods from this list in evidence_periods."
         + get_strategic_context()
@@ -358,7 +361,6 @@ def strategic_analyst_node(state: GraphState) -> Dict[str, Any]:
     guard_overhead = estimate_guard_overhead(DocumentBlueprint.model_json_schema())
     size = measure_messages_bytes(messages) + guard_overhead
 
-    # Budget guard: trim digests if needed
     if size > effective_budget():
         trimmed_text = "\n".join(
             f"[{p}] {digests[p][:150]}..." for p in sorted_periods
@@ -376,7 +378,8 @@ def strategic_analyst_node(state: GraphState) -> Dict[str, Any]:
     plog("strategic_analyst",
          f"blueprint: '{result.doc_title}' | "
          f"s1='{result.section_1.title}' ({len(result.section_1.evidence_periods)} periods) | "
-         f"s2='{result.section_2.title}' ({len(result.section_2.evidence_periods)} periods)")
+         f"s2='{result.section_2.title}' ({len(result.section_2.evidence_periods)} periods) | "
+         f"implications={len(result.implications_points)} points")
 
     save_json("phase3_blueprint.json", blueprint)
     return {"blueprint": blueprint}
@@ -399,8 +402,7 @@ def init_writing_node(state: GraphState) -> Dict[str, Any]:
 def section_writer_node(state: GraphState) -> Dict[str, Any]:
     """Write section body from source events across multiple months.
 
-    v3 KEY CHANGE: pulls events from MULTIPLE months via
-    blueprint.sections[idx].evidence_periods (cross-month narratives).
+    도메인 지식은 get_writing_context() 경유 자동 주입.
     """
     blueprint = state["blueprint"]
     idx = state["current_section_index"]
@@ -432,10 +434,11 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
         )
 
     system_content = (
-        "You are a whitepaper writer. Write a section for a 3-page business report. "
+        "You are a whitepaper writer. Write a section for a business report. "
         "Use ONLY the provided source events as evidence. NEVER fabricate facts. "
         f"Target length: ~{target_words} words (approximately 1 printed page). "
-        "Structure the content as a cohesive narrative, NOT a chronological list. "
+        "Structure the content as a cohesive THEMATIC narrative, NOT a chronological list. "
+        "Do NOT include month-by-month timelines. "
         "Use markdown: headers, bold for key metrics, bullet lists for enumerations."
         + get_writing_context()
         + _EN_ENFORCE
@@ -542,10 +545,8 @@ def section_writer_node(state: GraphState) -> Dict[str, Any]:
 def fact_checker_node(state: GraphState) -> Dict[str, Any]:
     """Fact-check section draft against source events.
 
-    v3: gathers events from MULTIPLE months via blueprint evidence_periods.
     --skip-fact-check 시 자동 승인.
     """
-    # ── 팩트체크 생략 모드: LLM 호출 없이 자동 승인 ──
     if _skip_fact_check:
         idx = state["current_section_index"]
         plog("fact_checker", f"idx={idx} SKIPPED (--skip-fact-check)")
@@ -561,7 +562,6 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
     plan = sections_list[idx]
     grouped = state["grouped_chunks"]
 
-    # Gather events from ALL evidence periods
     events: List[Dict] = []
     for period in plan["evidence_periods"]:
         events.extend(filter_by_period(grouped, period))
@@ -605,7 +605,7 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
             ),
         }
 
-    # Budget exceeded — batch split events (draft kept in each batch)
+    # Budget exceeded — batch split
     data_budget = available_data_budget(
         system_content,
         FactCheckResult.model_json_schema(),
@@ -625,7 +625,6 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
         + _EN_ENFORCE
     )
 
-    all_approved = True
     all_feedback: List[str] = []
     all_candidates: List[str] = []
 
@@ -642,11 +641,9 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
             batch_msgs, FactCheckResult, role="judge", temperature=0.0,
         )
         if not batch_result.is_draft_approved:
-            all_approved = False
             all_feedback.append(batch_result.feedback)
         all_candidates.extend(batch_result.hallucinated_terms)
 
-    # Cross-check: only truly absent tokens are hallucinations
     truly_hallucinated = cross_check_terms(all_candidates, events)
     is_approved = len(truly_hallucinated) == 0
     feedback = "; ".join(all_feedback) if all_feedback else "Batch verification passed"
@@ -662,11 +659,7 @@ def fact_checker_node(state: GraphState) -> Dict[str, Any]:
 
 
 def route_section_draft(state: GraphState) -> str:
-    """Route after fact-check:
-    - approved → save_section
-    - retry < 3 → retry_section
-    - retry >= 3 → save_section_with_warning
-    """
+    """Route after fact-check."""
     if state.get("is_draft_approved"):
         return "save_section"
     if state.get("section_retry_count", 0) >= 3:
@@ -718,16 +711,20 @@ def save_section_with_warning_node(state: GraphState) -> Dict[str, Any]:
 
 def route_next_section(state: GraphState) -> str:
     """All sections done → assembler, otherwise next section."""
-    if state["current_section_index"] >= 2:  # Fixed: always 2 sections in v3
+    if state["current_section_index"] >= 2:
         return "assembler"
     return "section_writer"
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 4: Assembly → Polish
+# Phase 4b: Assembly → Implications
 # ──────────────────────────────────────────────────────────────
 def assembler_node(state: GraphState) -> Dict[str, Any]:
-    """Pure Python assembly — no LLM calls. Combines completed sections."""
+    """Pure Python assembly — no LLM calls. Combines completed sections.
+
+    Sets final_compiled (body only). english_output is set by
+    implications_writer after appending the implications section.
+    """
     completed = state.get("completed_sections", {})
     blueprint = state["blueprint"]
     sections_plans = [blueprint["section_1"], blueprint["section_2"]]
@@ -741,14 +738,88 @@ def assembler_node(state: GraphState) -> Dict[str, Any]:
     compiled = "\n\n---\n\n".join(parts)
     save_text("phase4_compiled_en.md", compiled)
     plog("assembler", f"sections={len(completed)} compiled_len={len(compiled)}")
-    return {"final_compiled": compiled, "english_output": compiled}
+    return {"final_compiled": compiled}
 
 
 @retry_on_504
-def polish_node(state: GraphState) -> Dict[str, Any]:
-    """Proofread polish — single LLM call for ~800 words.
+def implications_writer_node(state: GraphState) -> Dict[str, Any]:
+    """Write the Implications (시사점) section based on compiled body and blueprint.
 
-    For v3's short output (~800 words total), a single call suffices.
+    Input: final_compiled (body only) + blueprint.implications_points
+    Output: implications_text + updated final_compiled (body + implications)
+
+    도메인 지식 + 시사점 지시는 get_implications_context() 경유 자동 주입.
+    """
+    blueprint = state["blueprint"]
+    compiled = state["final_compiled"]
+    implications_points = blueprint.get("implications_points", [])
+
+    points_text = "\n".join(f"- {p}" for p in implications_points)
+
+    system_content = (
+        "You are a senior business analyst writing the 'Implications' (시사점) section "
+        "of a whitepaper. Based on the body content and key points provided, "
+        "write a concise implications section (~200-300 words).\n\n"
+        "REQUIREMENTS:\n"
+        "- 3-5 implications, each with a brief explanation (2-3 sentences)\n"
+        "- Focus on actionable insights, strategic significance, and forward-looking analysis\n"
+        "- Do NOT repeat body content verbatim — synthesize and elevate\n"
+        "- Do NOT include month-by-month timelines or chronological breakdowns\n"
+        "- Use markdown: bold for key phrases, bullet lists for structure"
+        + get_implications_context()
+        + _EN_ENFORCE
+    )
+
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": (
+            f"Document body:\n{compiled}\n\n"
+            f"Key implications to address:\n{points_text}\n\n"
+            "Write implications section:"
+        )},
+    ]
+
+    guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
+    size = measure_messages_bytes(messages) + guard_overhead
+
+    if size > effective_budget():
+        # If body too large, summarize for implications
+        truncated = compiled[:effective_budget() // 2]
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": (
+                f"Document body (summary):\n{truncated}...\n\n"
+                f"Key implications to address:\n{points_text}\n\n"
+                "Write implications section:"
+            )},
+        ]
+        plog("implications_writer", f"budget exceeded ({size/1024:.1f}KB) — body truncated")
+
+    result = structured_call(
+        messages, PolishedDocument, role="writer", temperature=0.3,
+    )
+
+    impl_text = result.content
+
+    # Combine body + implications as full English document
+    full_english = compiled + "\n\n---\n\n## Implications\n\n" + impl_text
+    save_text("phase4_implications_en.md", impl_text)
+    plog("implications_writer", f"done: len={len(impl_text)}")
+
+    return {
+        "implications_text": impl_text,
+        "final_compiled": full_english,
+        "english_output": full_english,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# Phase 5: Polish → Translate
+# ──────────────────────────────────────────────────────────────
+@retry_on_504
+def polish_node(state: GraphState) -> Dict[str, Any]:
+    """Proofread polish — single LLM call for ~1000 words (body + implications).
+
     Falls back to no-polish if budget exceeded.
     """
     compiled = state["final_compiled"]
@@ -758,7 +829,7 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
         "information (dates, proper nouns, numbers, causal relationships). "
         "ONLY refine paragraph transitions, coherence, and awkward phrasing. "
         "NEVER fabricate new information. "
-        "Maintain markdown structure (headers, lists, blockquote warnings)."
+        "Maintain markdown structure (headers, lists, blockquote warnings, --- separators)."
         + _EN_ENFORCE
     )
     guard_overhead = estimate_guard_overhead(PolishedDocument.model_json_schema())
@@ -778,23 +849,25 @@ def polish_node(state: GraphState) -> Dict[str, Any]:
         save_text("phase4_polished_en.md", result.content)
         return {"final_compiled": result.content, "english_output": result.content}
 
-    # Budget exceeded (unlikely for ~800 words) — skip polish
     plog("polish", f"budget exceeded ({size/1024:.1f}KB) — skipping polish")
     save_text("phase4_polished_en.md", compiled)
     return {"final_compiled": compiled, "english_output": compiled}
 
 
 # ──────────────────────────────────────────────────────────────
-# Phase 5: Translation (English → Korean)
+# Phase 5b: Translation (English → Korean) with title translation
 # ──────────────────────────────────────────────────────────────
 @retry_on_504
 def translate_node(state: GraphState) -> Dict[str, Any]:
-    """Translate English whitepaper into Korean — v3.0 simplified.
+    """Translate English whitepaper into Korean — v3.1.
 
-    For ~800 English words, a single LLM call is sufficient.
-    No paragraph splitting, no completeness check, no source fallback.
+    Includes title/subtitle translation for DOCX cover page.
+    도메인 지식은 get_translation_context() 경유 자동 주입 (한국어).
     """
     english = state["english_output"]
+    blueprint = state.get("blueprint", {})
+    doc_title = blueprint.get("doc_title", "Untitled")
+    doc_subtitle = blueprint.get("doc_subtitle", "")
     proper_nouns = extract_proper_nouns(english)
 
     proper_nouns_list = "\n".join(
@@ -808,7 +881,14 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
         "2. 고유명사: 회사명, 프로젝트명, 기술 용어는 원문 그대로 유지.\n"
         "3. 톤: 공식 백서 평어체 (~다, ~함, ~구축됨).\n"
         "4. 핵심 수치는 **볼드** 유지.\n"
-        "5. 마크다운 구조 보존 (##, -, **, `)\n\n"
+        "5. 마크다운 구조 보존 (##, -, **, `, --- 구분선)\n"
+        "6. ## Implications → ## 시사점 으로 번역.\n\n"
+        "추가 지시:\n"
+        "- 응답 맨 앞에 다음 형식으로 문서 제목과 부제를 번역하여 포함:\n"
+        "  [제목] 한국어 제목\n"
+        "  [부제] 한국어 부제\n"
+        "  (빈 줄)\n"
+        "  그 후 본문 번역 시작\n\n"
         f"[보존 대상 고유명사]\n{proper_nouns_list}"
         + get_translation_context()
     )
@@ -817,6 +897,8 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
     messages = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": (
+            f"문서 제목: {doc_title}\n"
+            f"문서 부제: {doc_subtitle}\n\n"
             "다음 영문 백서를 한국어로 완전 번역하십시오.\n\n"
             f"---\n\n{english}"
         )},
@@ -828,56 +910,98 @@ def translate_node(state: GraphState) -> Dict[str, Any]:
              f"budget exceeded ({size/1024:.1f}KB) — keeping English as fallback")
         save_text("phase5_output_kr.md", english)
         save_text("phase5_output_en.md", english)
-        return {"final_output": english}
+        return {
+            "final_output": english,
+            "doc_title_kr": doc_title,
+            "doc_subtitle_kr": doc_subtitle,
+        }
 
     result = structured_call(
         messages, PolishedDocument, role="writer",
         temperature=0.2, stream=True,
     )
-    plog("translate",
-         f"done: en={len(english)} kr={len(result.content)} "
-         f"ratio={len(result.content)/max(len(english),1):.2f}")
 
-    save_text("phase5_output_kr.md", result.content)
+    kr_text = result.content
+
+    # Extract [제목] and [부제] from response
+    kr_title = doc_title
+    kr_subtitle = doc_subtitle
+    body_text = kr_text
+
+    title_match = re.search(r'\[제목\]\s*(.+)', kr_text)
+    subtitle_match = re.search(r'\[부제\]\s*(.+)', kr_text)
+
+    if title_match:
+        kr_title = title_match.group(1).strip()
+    if subtitle_match:
+        kr_subtitle = subtitle_match.group(1).strip()
+
+    # Remove [제목]/[부제] lines from body
+    if title_match or subtitle_match:
+        body_text = re.sub(r'\[제목\].*\n?', '', body_text)
+        body_text = re.sub(r'\[부제\].*\n?', '', body_text)
+        body_text = body_text.strip()
+
+    plog("translate",
+         f"done: en={len(english)} kr={len(body_text)} "
+         f"title='{kr_title[:30]}' ratio={len(body_text)/max(len(english),1):.2f}")
+
+    save_text("phase5_output_kr.md", body_text)
     save_text("phase5_output_en.md", english)
-    return {"final_output": result.content}
+    return {
+        "final_output": body_text,
+        "doc_title_kr": kr_title,
+        "doc_subtitle_kr": kr_subtitle,
+    }
 
 
 # ──────────────────────────────────────────────────────────────
 # Phase 6: DOCX Builder
 # ──────────────────────────────────────────────────────────────
 def _split_korean_sections(text: str) -> list:
-    """Split translated Korean text into 2 sections."""
-    # Try splitting on horizontal rule
+    """Split translated Korean text into body sections + implications.
+
+    Expected structure (separated by ---):
+      [0] body section 1
+      [1] body section 2
+      [2] implications (## 시사점)
+    """
     if "\n---\n" in text:
-        parts = text.split("\n---\n", 1)
-        return [p.strip() for p in parts]
-    # Try splitting on ## heading
-    parts = re.split(r'\n(?=## )', text, maxsplit=1)
-    if len(parts) == 2:
-        return [p.strip() for p in parts]
-    # Fallback: split roughly in half by paragraphs
-    paragraphs = text.split("\n\n")
-    mid = len(paragraphs) // 2
-    return [
-        "\n\n".join(paragraphs[:mid]).strip(),
-        "\n\n".join(paragraphs[mid:]).strip(),
-    ]
+        parts = [p.strip() for p in text.split("\n---\n") if p.strip()]
+        return parts
+
+    # Fallback: split by ## headings
+    parts = re.split(r'\n(?=## )', text)
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts if parts else [text]
 
 
 def docx_builder_node(state: GraphState) -> Dict[str, Any]:
-    """Build DOCX from blueprint + translated Korean sections."""
+    """Build DOCX from blueprint + translated Korean content.
+
+    v3.1: 한글 제목/부제 지원, 본문 연속 흐름, 시사점 섹션 포함.
+    """
     from .docx_builder import DocxBuilder
     from .artifacts import get_run_dir
 
     blueprint = state["blueprint"]
     korean_text = state["final_output"]
+    kr_title = state.get("doc_title_kr", "")
+    kr_subtitle = state.get("doc_subtitle_kr", "")
 
-    # Split Korean text into 2 sections
-    sections = _split_korean_sections(korean_text)
+    # Split into parts: [body_1, body_2, implications, ...]
+    parts = _split_korean_sections(korean_text)
+    body_sections = parts[:2] if len(parts) >= 2 else parts
+    implications_text = parts[2] if len(parts) >= 3 else ""
 
     meta = get_docx_meta()
-    builder = DocxBuilder(blueprint, sections, meta)
+    # Override with Korean titles if available
+    if kr_title:
+        meta["title"] = kr_title
+    if kr_subtitle:
+        meta["subtitle"] = kr_subtitle
+
+    builder = DocxBuilder(blueprint, body_sections, implications_text, meta)
 
     run_dir = get_run_dir()
     output_path = str(Path(run_dir) / "output.docx") if run_dir else "output.docx"

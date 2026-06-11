@@ -1,11 +1,16 @@
 """
-DOCX Builder — v3.0.
+DOCX Builder — v3.1.
 
-Builds a professional 3-page DOCX:
-  Cover (1 page) + Body Section 1 (1 page) + Body Section 2 (1 page)
+Builds a professional business report DOCX:
+  Cover (1 page) + Body sections (flowing) + Implications (시사점)
 
-Uses python-docx with lxml helpers for section properties
-(different first-page header/footer).
+v3.1 changes:
+  - Body sections flow continuously (no forced page break between them)
+  - Implications section appended after body with subtle divider
+  - Korean title/subtitle support on cover page
+  - Section dividers between body sections
+
+Uses python-docx with lxml helpers for section properties.
 """
 from __future__ import annotations
 
@@ -24,35 +29,38 @@ from lxml import etree
 
 
 # ════════════════════════════════════════════════════════════════
-# Color constants
+# Color / Style constants
 # ════════════════════════════════════════════════════════════════
 NAVY = RGBColor(0x1B, 0x36, 0x5D)
 GRAY_SUBTITLE = RGBColor(0x5B, 0x7B, 0x9A)
 BODY_TEXT_COLOR = RGBColor(0x33, 0x33, 0x33)
 ACCENT_LINE_COLOR = "1B365D"
+DIVIDER_COLOR = "CCCCCC"
 
-# Font names
 FONT_PRIMARY = "맑은 고딕"
 FONT_FALLBACK = "Calibri"
 
 
 class DocxBuilder:
-    """Build a 3-page DOCX from blueprint + translated Korean sections."""
+    """Build a professional DOCX: cover + body sections + implications."""
 
     def __init__(
         self,
         blueprint: dict,
-        korean_sections: list[str],
+        body_sections: list[str],
+        implications_text: str,
         meta: dict,
     ):
         """
         Args:
             blueprint: DocumentBlueprint as dict.
-            korean_sections: [section_1_korean_md, section_2_korean_md]
-            meta: from prompt_config.get_docx_meta()
+            body_sections: [section_1_korean_md, section_2_korean_md]
+            implications_text: Korean implications markdown (may start with ## 시사점)
+            meta: from prompt_config.get_docx_meta() + kr title overrides
         """
         self.blueprint = blueprint
-        self.korean_sections = korean_sections
+        self.body_sections = body_sections
+        self.implications_text = implications_text
         self.meta = meta
         self.doc = Document()
 
@@ -68,17 +76,18 @@ class DocxBuilder:
         # Cover page
         self._build_cover()
 
-        # Body section 1
+        # Body content — new page, sections flow continuously
         self._add_page_break_section()
-        section_1_plan = self.blueprint.get("section_1", {})
-        body_1 = self.korean_sections[0] if len(self.korean_sections) > 0 else ""
-        self._build_body_page(section_1_plan, body_1)
 
-        # Body section 2
-        self._add_page_break_section()
-        section_2_plan = self.blueprint.get("section_2", {})
-        body_2 = self.korean_sections[1] if len(self.korean_sections) > 1 else ""
-        self._build_body_page(section_2_plan, body_2)
+        for i, section_text in enumerate(self.body_sections):
+            if i > 0:
+                self._add_section_divider()
+            self._render_markdown(section_text)
+
+        # Implications section
+        if self.implications_text:
+            self._add_section_divider()
+            self._render_markdown(self.implications_text)
 
         # Headers & footers (not on cover)
         self._setup_headers_footers()
@@ -101,7 +110,6 @@ class DocxBuilder:
         style.paragraph_format.space_after = Pt(6)
         style.paragraph_format.line_spacing = 1.15
 
-        # Set East Asian font via XML
         rpr = style.element.get_or_add_rPr()
         rfonts = rpr.find(qn("w:rFonts"))
         if rfonts is None:
@@ -131,7 +139,7 @@ class DocxBuilder:
         doc_subtitle = self.meta.get("subtitle") or self.blueprint.get("doc_subtitle", "")
         organization = self.meta.get("organization", "")
 
-        # Spacer paragraphs to push title toward center
+        # Spacer to push title toward center
         for _ in range(6):
             spacer = self.doc.add_paragraph()
             spacer.paragraph_format.space_before = Pt(0)
@@ -149,7 +157,7 @@ class DocxBuilder:
         run.bold = True
         self._set_run_east_asian_font(run)
 
-        # Accent line (horizontal rule)
+        # Accent line
         self._add_accent_line()
 
         # Subtitle
@@ -194,13 +202,12 @@ class DocxBuilder:
             self._set_run_east_asian_font(run)
 
     def _add_accent_line(self):
-        """Add a centered accent line (colored border-bottom on an empty paragraph)."""
+        """Add a centered accent line (navy bottom border)."""
         p = self.doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_before = Pt(4)
         p.paragraph_format.space_after = Pt(4)
 
-        # Use bottom border on the paragraph
         pPr = p._element.get_or_add_pPr()
         pBdr = parse_xml(
             f'<w:pBdr {nsdecls("w")}>'
@@ -210,37 +217,38 @@ class DocxBuilder:
         )
         pPr.append(pBdr)
 
-        # Constrain width with indentation
         ind = parse_xml(
             f'<w:ind {nsdecls("w")} w:left="2880" w:right="2880"/>'
         )
         pPr.append(ind)
 
     # ────────────────────────────────────────────────────────────
-    # Body pages
+    # Section dividers
     # ────────────────────────────────────────────────────────────
 
-    def _build_body_page(self, section_plan: dict, markdown_body: str):
-        """Build a single body page from section plan and markdown content."""
-        title = section_plan.get("title", "")
-        if title:
-            p_heading = self.doc.add_paragraph()
-            p_heading.paragraph_format.space_before = Pt(0)
-            p_heading.paragraph_format.space_after = Pt(10)
-            run = p_heading.add_run(title)
-            run.font.size = Pt(16)
-            run.font.color.rgb = NAVY
-            run.bold = True
-            run.font.name = FONT_PRIMARY
-            self._set_run_east_asian_font(run)
+    def _add_section_divider(self):
+        """Add a subtle thin gray line between content sections."""
+        p = self.doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(16)
+        p.paragraph_format.space_after = Pt(16)
 
-        # Parse markdown body into paragraphs
-        self._render_markdown(markdown_body)
+        pPr = p._element.get_or_add_pPr()
+        pBdr = parse_xml(
+            f'<w:pBdr {nsdecls("w")}>'
+            f'  <w:bottom w:val="single" w:sz="4" w:space="1" '
+            f'           w:color="{DIVIDER_COLOR}"/>'
+            f'</w:pBdr>'
+        )
+        pPr.append(pBdr)
+
+    # ────────────────────────────────────────────────────────────
+    # Markdown rendering (body pages)
+    # ────────────────────────────────────────────────────────────
 
     def _render_markdown(self, md_text: str):
         """Parse markdown text and render into DOCX paragraphs.
 
-        Supports: ## headings, - bullet lists, **bold**, `code`.
+        Supports: ## headings, ### subheadings, - bullet lists, **bold**, `code`.
         """
         if not md_text:
             return
@@ -251,7 +259,6 @@ class DocxBuilder:
             line = lines[i]
             stripped = line.strip()
 
-            # Skip empty lines
             if not stripped:
                 i += 1
                 continue
@@ -262,8 +269,8 @@ class DocxBuilder:
                 level = len(heading_match.group(1))
                 text = heading_match.group(2)
                 p = self.doc.add_paragraph()
-                p.paragraph_format.space_before = Pt(12) if level == 2 else Pt(8)
-                p.paragraph_format.space_after = Pt(6)
+                p.paragraph_format.space_before = Pt(14) if level == 2 else Pt(8)
+                p.paragraph_format.space_after = Pt(8) if level == 2 else Pt(6)
                 run = p.add_run(text)
                 run.font.size = Pt(16) if level == 2 else Pt(13)
                 run.font.color.rgb = NAVY
@@ -306,7 +313,6 @@ class DocxBuilder:
 
     def _add_inline_formatted_runs(self, paragraph, text: str):
         """Parse inline markdown (**bold**, `code`) and add as runs."""
-        # Split by **bold** and `code` patterns
         pattern = re.compile(r'(\*\*.*?\*\*|`[^`]+`)')
         parts = pattern.split(text)
 
@@ -356,7 +362,7 @@ class DocxBuilder:
         """
         doc_title = self.meta.get("title") or self.blueprint.get("doc_title", "Untitled")
 
-        # Section 0 (cover): enable "different first page" so header/footer are blank
+        # Section 0 (cover): enable "different first page" for blank header/footer
         section_0 = self.doc.sections[0]
         sectPr = section_0._sectPr
         titlePg = sectPr.find(qn("w:titlePg"))
@@ -364,20 +370,15 @@ class DocxBuilder:
             titlePg = parse_xml(f'<w:titlePg {nsdecls("w")}/>')
             sectPr.append(titlePg)
 
-        # For body sections (1 and 2), add header and footer
+        # Body sections: header + footer
         for sec_idx in range(1, len(self.doc.sections)):
             section = self.doc.sections[sec_idx]
-
-            # Unlink from previous so each section can have its own header/footer
             section.header.is_linked_to_previous = False
             section.footer.is_linked_to_previous = False
 
-            # Header: document title
+            # Header: document title (right-aligned, small)
             header = section.header
-            if header.paragraphs:
-                hp = header.paragraphs[0]
-            else:
-                hp = header.add_paragraph()
+            hp = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
             hp.text = ""
             run = hp.add_run(doc_title)
             run.font.size = Pt(8)
@@ -386,12 +387,9 @@ class DocxBuilder:
             self._set_run_east_asian_font(run)
             hp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-            # Footer: page number
+            # Footer: page number (centered)
             footer = section.footer
-            if footer.paragraphs:
-                fp = footer.paragraphs[0]
-            else:
-                fp = footer.add_paragraph()
+            fp = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
             fp.text = ""
             fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
             self._add_page_number_field(fp)

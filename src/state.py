@@ -32,10 +32,15 @@ class GraphState(TypedDict, total=False):
     section_retry_count: int
     completed_sections: Annotated[Dict[int, str], update_dict]
     
+    # Phase 4b: Implications
+    implications_text: str
+
     # Phase 5: Assembly + Polish + Translate
     final_compiled: str
     english_output: str
     final_output: str
-    
+    doc_title_kr: str
+    doc_subtitle_kr: str
+
     # Phase 6: DOCX
     docx_path: str

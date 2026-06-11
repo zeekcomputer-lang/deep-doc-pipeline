@@ -34,6 +34,10 @@ class DocumentBlueprint(BaseModel):
     doc_subtitle: str = Field(..., description="Subtitle with date range or scope")
     section_1: SectionPlan = Field(..., description="Plan for body page 1")
     section_2: SectionPlan = Field(..., description="Plan for body page 2")
+    implications_points: List[str] = Field(
+        ...,
+        description="3-5 key strategic implications/insights to discuss in the final section",
+    )
 
 
 # Phase 4: Writing + Fact-check (kept from v2)
